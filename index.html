@@ -310,7 +310,7 @@
     warn.innerHTML = "";
     if (!email || !pw){ warn.innerHTML = '<div class="rec-warn">Enter an email and password.</div>'; return; }
     auth.signInWithEmailAndPassword(email, pw).catch(function(err){
-      if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential"){
+      if (err.code === "auth/user-not-found" || err.code === "auth/invalid-credential" || err.code === "auth/invalid-login-credentials"){
         auth.createUserWithEmailAndPassword(email, pw).catch(function(err2){
           warn.innerHTML = '<div class="rec-warn">' + esc(err2.message) + '</div>';
         });
