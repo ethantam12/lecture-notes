@@ -501,7 +501,7 @@
     rec = {
       mode: "live", title: defaultRecTitle(), active: false, elapsedSec: 0, timerInt: null,
       stream: null, recorder: null, chunks: [], finishing: false, uploading: false,
-      finalTranscript: "", interimTranscript: "", recognition: null,
+      finalTranscript: "", interimTranscript: "", recognition: null, priorTranscript: "",
       supportsSpeech: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
       mimeType: pickMimeType(), error: null
     };
@@ -559,7 +559,8 @@
     var courseId = state.currentCourseId;
     var title = rec.title;
     var durationSec = Math.round(rec.elapsedSec);
-    var transcript = (rec.finalTranscript || "").trim();
+    var priorPart = (rec.priorTranscript || "").trim();
+    var transcript = (priorPart ? priorPart + "\n\n" : "") + (rec.finalTranscript || "").trim();
     var ext = rec.mimeType.indexOf("ogg") > -1 ? "ogg" : (rec.mimeType.indexOf("mp4") > -1 ? "m4a" : "webm");
     rec.uploading = true;
     renderContent();
@@ -743,6 +744,39 @@
     content.appendChild(list);
   }
 
+  function renderTranscriptField(label, placeholder, getValue, setValue){
+    var panel = el("div",{class:"panel"});
+    var ta = el("textarea",{placeholder: placeholder});
+    ta.value = getValue() || "";
+    ta.addEventListener("input", function(){ setValue(ta.value); });
+    var fileInput = el("input",{type:"file", accept:".txt,text/plain", style:"display:none;"});
+    fileInput.addEventListener("change", function(){
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(){
+        var incoming = String(reader.result || "");
+        var replace = true;
+        if ((ta.value || "").trim()){
+          replace = confirm("Replace the existing text with this file's contents? Click Cancel to append instead.");
+        }
+        ta.value = replace ? incoming : (ta.value + "\n\n" + incoming);
+        setValue(ta.value);
+      };
+      reader.onerror = function(){ alert("Couldn't read that file."); };
+      reader.readAsText(file);
+      fileInput.value = "";
+    });
+    var uploadBtn = el("button",{class:"btn btn-outline", type:"button", style:"padding:4px 10px; font-size:12.5px;", onclick: function(){ fileInput.click(); }},[text("Upload .txt file")]);
+    panel.appendChild(el("div",{class:"panel-label", style:"display:flex; align-items:center; justify-content:space-between;"},[
+      el("div",{},[text(label)]),
+      uploadBtn
+    ]));
+    panel.appendChild(fileInput);
+    panel.appendChild(ta);
+    return panel;
+  }
+
   function renderRecordingPanel(content){
     var panel = el("div",{class:"rec-panel"});
     if (!rec){ content.appendChild(panel); return; }
@@ -769,10 +803,12 @@
       panel.appendChild(el("div",{class:"panel-label"},[text("Audio file")]));
       panel.appendChild(el("div",{style:"margin-bottom:18px;"},[fileInput]));
 
-      var ta = el("textarea",{placeholder:"Paste a transcript here (optional)."});
-      ta.value = rec.pastedTranscript || "";
-      ta.addEventListener("input", function(){ rec.pastedTranscript = ta.value; });
-      panel.appendChild(el("div",{class:"panel"},[ el("div",{class:"panel-label"},[text("Transcript (optional)")]), ta ]));
+      panel.appendChild(renderTranscriptField(
+        "Transcript (optional)",
+        "Paste a transcript here, or upload a .txt file from a previous recording.",
+        function(){ return rec.pastedTranscript; },
+        function(v){ rec.pastedTranscript = v; }
+      ));
 
       panel.appendChild(el("div",{class:"rec-actions"},[
         el("button",{class:"btn btn-primary", disabled: rec.uploading, onclick: beginImportUpload},[text(rec.uploading ? "Uploading…" : "Save recording")]),
@@ -788,6 +824,12 @@
       panel.appendChild(titleInput);
       if (rec.error) panel.appendChild(el("div",{class:"rec-warn"},[text(rec.error)]));
       if (!rec.supportsSpeech) panel.appendChild(el("div",{class:"rec-note", style:"margin-bottom:16px;"},[text("Live transcription isn't supported in this browser — audio will still record fine.")]));
+      panel.appendChild(renderTranscriptField(
+        "Transcript from a previous recording (optional)",
+        "Paste text here, or upload a .txt file — it'll be placed before whatever gets recorded live, so the two read as one continuous transcript.",
+        function(){ return rec.priorTranscript; },
+        function(v){ rec.priorTranscript = v; }
+      ));
       panel.appendChild(el("div",{class:"rec-actions"},[
         el("button",{class:"btn btn-primary", onclick: beginCapture},[icon("mic"), text("Start recording")]),
         el("button",{class:"btn btn-outline", onclick: function(){ rec=null; backToList(); }},[text("Cancel")])
