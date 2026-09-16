@@ -109,8 +109,6 @@
   @keyframes pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.35; } }
   .rec-timer{ font-family:"IBM Plex Mono", monospace; font-size:30px; font-weight:500; }
   .rec-note{ color:var(--faint); font-size:12.5px; }
-  .live-caption{ background:#0b0d14; color:#fdfdff; font-size:21px; font-weight:600; line-height:1.45; text-align:center; padding:20px 26px; border-radius:12px; min-height:88px; display:flex; align-items:center; justify-content:center; margin-bottom:10px; transition:opacity .12s ease; }
-  .live-caption.empty{ color:rgba(255,255,255,.55); font-weight:500; font-size:15px; }
   .transcript-label{ font-family:"IBM Plex Mono", monospace; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--faint); margin-bottom:6px; }
   .rec-transcript{ background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:14px; height:110px; overflow-y:auto; color:var(--muted); font-size:13px; line-height:1.6; margin-bottom:20px; }
   .rec-transcript .final{ color:var(--ink); }
@@ -603,7 +601,7 @@
       finalTranscript: "", interimTranscript: "", recognition: null, priorTranscript: "",
       supportsSpeech: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
       mimeType: pickMimeType(), error: null, slideFiles: [], lastResultAt: 0, watchdogInt: null,
-      aiTranscript: [], aiChunkIndex: 0, aiChunking: false, currentChunkRecorder: null, pendingChunkPromises: []
+      aiTranscript: [], aiChunkFallback: [], aiChunkIndex: 0, aiChunking: false, currentChunkRecorder: null, pendingChunkPromises: []
     };
     renderContent();
   }
@@ -672,19 +670,23 @@
   }
 
   // Combines whatever the periodic AI re-transcription produced during the
-  // recording into the final transcript, falling back to the live Web Speech
-  // captions if AI chunking wasn't enabled or most chunks failed (e.g. AI
-  // quota hit) — so a rough transcript is still always saved either way.
+  // recording into the final transcript. Any individual ~30s chunk that
+  // failed to transcribe (a brief network hiccup, a rate limit, etc.) no
+  // longer leaves a literal "[segment unavailable]" gap — instead it's
+  // filled in with whatever the live Web Speech transcript picked up during
+  // that same stretch (captured in rec.aiChunkFallback as each chunk closes),
+  // so the saved transcript reads as continuous instead of "pausing".
   function buildFinalTranscript(){
     var parts = (rec && rec.aiTranscript) || [];
+    var fallback = (rec && rec.aiChunkFallback) || [];
     var total = (rec && rec.aiChunkIndex) || 0;
-    var have = parts.filter(function(t){ return t && t.trim(); }).length;
-    if (total > 0 && have >= Math.ceil(total * 0.6)){
+    if (total > 0){
       var combined = [];
       for (var i = 0; i < total; i++){
-        combined.push(parts[i] && parts[i].trim() ? parts[i].trim() : "[segment unavailable]");
+        var t = (parts[i] && parts[i].trim()) || (fallback[i] && fallback[i].trim()) || "";
+        if (t) combined.push(t);
       }
-      return combined.join("\n\n");
+      if (combined.length) return combined.join("\n\n");
     }
     return (rec && rec.finalTranscript || "").trim();
   }
@@ -729,22 +731,6 @@
   // That's the "words show up for a second then vanish" behavior. Flushing
   // whatever is currently interim into the permanent transcript right before
   // any restart (or before the user stops recording) fixes it.
-  // Pulls just the tail end of the transcript so the live caption reads like
-  // TV subtitles — a short, current line — rather than the whole growing wall
-  // of text. Trims to a whole-word boundary so it doesn't start mid-word.
-  function captionSnippet(text, maxChars){
-    text = String(text || "").replace(/\s+/g, " ").trim();
-    if (!text) return "";
-    if (text.length <= maxChars) return text;
-    var slice = text.slice(-maxChars);
-    var spaceIdx = slice.indexOf(" ");
-    return (spaceIdx > -1 ? slice.slice(spaceIdx + 1) : slice).trim();
-  }
-  function emptyCaptionMessage(){
-    if (rec && rec.supportsSpeech) return "Listening…";
-    if (AI_ENABLED) return "Live captions aren't supported in this browser — AI is transcribing in the background instead.";
-    return "Live captions aren't supported in this browser.";
-  }
   function updateTranscriptUI(){
     if (!rec) return;
     var full = rec.finalTranscript || "";
@@ -753,12 +739,6 @@
     if (box){
       box.innerHTML = '<span class="final">' + esc(full) + '</span>' + esc(interim);
       box.scrollTop = box.scrollHeight;
-    }
-    var caption = document.getElementById("liveCaption");
-    if (caption){
-      var snippet = captionSnippet(full + interim, 130);
-      if (snippet){ caption.textContent = snippet; caption.classList.remove("empty"); }
-      else { caption.textContent = emptyCaptionMessage(); caption.classList.add("empty"); }
     }
   }
   function flushInterim(){
@@ -857,8 +837,8 @@
       reader.readAsDataURL(blob);
     });
   }
-  function transcribeChunk(blob, idx){
-    var p = blobToBase64(blob).then(function(b64){
+  function transcribeChunkAttempt(blob){
+    return blobToBase64(blob).then(function(b64){
       return fetch(window.aiConfig.workerUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -869,11 +849,22 @@
         if (!res.ok) throw new Error(data && data.error || "Request failed");
         return data.transcript || "";
       });
+    });
+  }
+  // A single transient failure (a brief network blip, a momentary rate
+  // limit) used to permanently blank out that ~30s slice of the transcript.
+  // One quick retry clears up most of those before falling back to the live
+  // Web Speech text captured for this same stretch (see scheduleNextAiChunk).
+  function transcribeChunk(blob, idx){
+    var p = transcribeChunkAttempt(blob).catch(function(){
+      return new Promise(function(resolve){ setTimeout(resolve, 1500); }).then(function(){
+        return transcribeChunkAttempt(blob);
+      });
     }).then(function(t){
       if (rec) rec.aiTranscript[idx] = t.trim();
     }).catch(function(){
-      // Leave this slot empty — buildFinalTranscript() falls back gracefully
-      // to the live captions if too many chunks come back empty.
+      // Both attempts failed — buildFinalTranscript() falls back to the
+      // Web Speech text captured for this chunk's time window instead.
     });
     if (rec) rec.pendingChunkPromises = (rec.pendingChunkPromises || []).concat([p]);
     return p;
@@ -884,9 +875,18 @@
     try{ chunkRecorder = new MediaRecorder(rec.stream, { mimeType: rec.mimeType, audioBitsPerSecond: AUDIO_BITRATE }); }
     catch(e){ return; }
     var localChunks = [];
+    // Remember where the live Web Speech transcript stood right as this
+    // chunk starts, so if the AI re-transcription for it fails, we can fill
+    // the gap with whatever Web Speech heard during this same window instead
+    // of leaving it blank.
+    var speechMarkStart = (rec.finalTranscript || "").length;
     chunkRecorder.ondataavailable = function(ev){ if (ev.data && ev.data.size > 0) localChunks.push(ev.data); };
     chunkRecorder.onstop = function(){
       var idx = rec ? rec.aiChunkIndex++ : 0;
+      if (rec){
+        var speechMarkEnd = (rec.finalTranscript || "").length;
+        rec.aiChunkFallback[idx] = (rec.finalTranscript || "").slice(speechMarkStart, speechMarkEnd);
+      }
       if (rec && rec.aiChunking) scheduleNextAiChunk();
       var blob = new Blob(localChunks, { type: (chunkRecorder.mimeType || rec.mimeType || "audio/webm").split(";")[0] });
       if (blob.size > 2000) transcribeChunk(blob, idx);
@@ -902,6 +902,7 @@
   function startAiChunking(){
     if (!rec) return;
     rec.aiTranscript = [];
+    rec.aiChunkFallback = [];
     rec.aiChunkIndex = 0;
     rec.pendingChunkPromises = [];
     rec.aiChunking = true;
@@ -1253,12 +1254,7 @@
       el("div",{class:"rec-timer mono", id:"recTimer"},[text(fmtTimer(rec.elapsedSec))]),
       el("div",{class:"rec-note"},[text(rec.uploading ? "Saving…" : (rec.finishing ? "Finishing up…" : "Recording"))])
     ]));
-    var captionSnippetInit = captionSnippet((rec.finalTranscript || "") + (rec.interimTranscript || ""), 130);
-    var captionEl = el("div",{class:"live-caption" + (captionSnippetInit ? "" : " empty"), id:"liveCaption"},[
-      text(captionSnippetInit || emptyCaptionMessage())
-    ]);
-    panel.appendChild(captionEl);
-    if (AI_ENABLED) panel.appendChild(el("div",{class:"rec-note", style:"margin:-4px 0 14px;"},[text("AI is also quietly re-checking the actual audio every 30 seconds for extra accuracy — that's what gets saved.")]));
+    if (AI_ENABLED) panel.appendChild(el("div",{class:"rec-note", style:"margin-bottom:10px;"},[text("AI is also quietly re-checking the actual audio every 30 seconds for extra accuracy — that's what gets saved.")]));
     panel.appendChild(el("div",{class:"transcript-label"},[text("Full transcript so far")]));
     var transcriptBox = el("div",{class:"rec-transcript", id:"recTranscript"});
     transcriptBox.innerHTML = '<span class="final">' + esc(rec.finalTranscript) + '</span>' + esc(rec.interimTranscript || (rec.supportsSpeech ? "" : "(no live transcript in this browser)"));
