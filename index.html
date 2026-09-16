@@ -323,7 +323,9 @@
       trash: '<path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2m2 0v13a1 1 0 01-1 1H8a1 1 0 01-1-1V7h10z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
       back: '<path d="M15 6l-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
       upload: '<path d="M12 16V4M12 4l-4.5 4.5M12 4l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
-      pencil: '<path d="M4 20h4l10.5-10.5a2 2 0 000-2.83l-1.17-1.17a2 2 0 00-2.83 0L4 16v4z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'
+      pencil: '<path d="M4 20h4l10.5-10.5a2 2 0 000-2.83l-1.17-1.17a2 2 0 00-2.83 0L4 16v4z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+      home: '<path d="M4 11l8-7 8 7M6 9.5V20a1 1 0 001 1h4v-6h2v6h4a1 1 0 001-1V9.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+      transcript: '<path d="M7 3h7l4 4v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 8h2M9 12h6M9 16h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>'
     };
     var svg = document.createElementNS("http://www.w3.org/2000/svg","svg");
     svg.setAttribute("width","16"); svg.setAttribute("height","16"); svg.setAttribute("viewBox","0 0 24 24"); svg.setAttribute("fill","none");
@@ -440,6 +442,14 @@
       notesText: bodyText || "", transcript: "", audioPath: null, slidePaths: [], createdAt: nowIso()
     }).then(function(ref){ openEntry(ref.id); });
   }
+  function addTranscriptEntry(title, transcriptText){
+    var courseId = state.currentCourseId;
+    if (!courseId) return;
+    db.collection("courses/" + courseId + "/entries").add({
+      type: "transcript", title: title || "Untitled transcript", date: nowIso(),
+      notesText: "", transcript: transcriptText || "", audioPath: null, slidePaths: [], createdAt: nowIso()
+    }).then(function(ref){ openEntry(ref.id); });
+  }
   function openEntry(id){ state.currentEntryId = id; state.view = "detail"; render(); }
   function backToList(){ state.view = "list"; state.currentEntryId = null; render(); }
   function updateEntry(id, patch){
@@ -503,12 +513,12 @@
       stream: null, recorder: null, chunks: [], finishing: false, uploading: false,
       finalTranscript: "", interimTranscript: "", recognition: null, priorTranscript: "",
       supportsSpeech: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
-      mimeType: pickMimeType(), error: null
+      mimeType: pickMimeType(), error: null, slideFiles: []
     };
     renderContent();
   }
   function chooseImportMode(){
-    rec = { mode: "import", title: defaultRecTitle(), file: null, pastedTranscript: "", uploading: false, error: null };
+    rec = { mode: "import", title: defaultRecTitle(), file: null, pastedTranscript: "", uploading: false, error: null, slideFiles: [] };
     renderContent();
   }
 
@@ -561,6 +571,7 @@
     var durationSec = Math.round(rec.elapsedSec);
     var priorPart = (rec.priorTranscript || "").trim();
     var transcript = (priorPart ? priorPart + "\n\n" : "") + (rec.finalTranscript || "").trim();
+    var slideFiles = (rec.slideFiles || []).slice();
     var ext = rec.mimeType.indexOf("ogg") > -1 ? "ogg" : (rec.mimeType.indexOf("mp4") > -1 ? "m4a" : "webm");
     rec.uploading = true;
     renderContent();
@@ -571,6 +582,8 @@
         type: "lecture", title: title, date: nowIso(), durationSec: durationSec,
         audioPath: path, transcript: transcript, notesText: "", slidePaths: [], createdAt: nowIso()
       });
+    }).then(function(){
+      return Promise.all(slideFiles.map(function(f){ return uploadSlide({id: entryId}, f).catch(function(){}); }));
     }).then(function(){
       rec = null;
       openEntry(entryId);
@@ -612,6 +625,7 @@
     renderContent();
     var courseId = state.currentCourseId;
     var file = rec.file;
+    var slideFiles = (rec.slideFiles || []).slice();
     var ext = (file.name.split(".").pop() || "webm").toLowerCase();
     var entryId = db.collection("courses/" + courseId + "/entries").doc().id;
     var path = courseId + "/" + entryId + "." + ext;
@@ -620,6 +634,8 @@
         type: "lecture", title: rec.title, date: nowIso(), durationSec: 0,
         audioPath: path, transcript: (rec.pastedTranscript || "").trim(), notesText: "", slidePaths: [], createdAt: nowIso()
       });
+    }).then(function(){
+      return Promise.all(slideFiles.map(function(f){ return uploadSlide({id: entryId}, f).catch(function(){}); }));
     }).then(function(){ rec = null; openEntry(entryId); }).catch(function(err){
       rec.uploading = false; rec.error = "Couldn't upload that file (" + (err && err.message || err) + "). Try again.";
       renderContent();
@@ -631,9 +647,18 @@
   // ---------------------------------------------------------------
   function render(){ renderSidebar(); renderHeader(); renderContent(); }
 
+  function goHome(){
+    state.view = "home";
+    state.currentEntryId = null;
+    render();
+  }
+
   function renderSidebar(){
     var list = document.getElementById("courseList");
     list.innerHTML = "";
+    list.appendChild(el("div", {class:"course-item" + (state.view === "home" ? " active" : ""), onclick: goHome}, [
+      icon("home"), el("div", {class:"course-name"}, [text("Home")])
+    ]));
     state.courses.forEach(function(c){
       var item = el("div", { class: "course-item" + (c.id === state.currentCourseId ? " active" : ""), onclick: function(){ selectCourse(c.id); } }, [
         el("div", {class:"course-dot"}), el("div", {class:"course-name"}, [text(c.name)])
@@ -649,6 +674,12 @@
   function renderHeader(){
     var header = document.getElementById("mainHeader");
     header.innerHTML = "";
+    if (state.view === "home"){
+      header.appendChild(el("h1", {}, [text("Home")]));
+      header.appendChild(el("div", {class:"header-spacer"}));
+      header.appendChild(el("button", {class:"btn btn-primary", onclick: openCourseModal}, [text("+ Add course")]));
+      return;
+    }
     var course = state.courses.find(function(c){ return c.id === state.currentCourseId; });
     if (!course){ header.appendChild(el("h1", {}, [text("Lecture Notes")])); return; }
     if (state.view === "recording"){ header.appendChild(el("h1", {}, [text("Recording")])); header.appendChild(el("span",{class:"header-meta"},[text(course.name)])); return; }
@@ -661,7 +692,9 @@
     input.addEventListener("input", function(){ state.searchTerm = input.value; renderContent(); });
     search.appendChild(input);
     header.appendChild(search);
+    if (AI_ENABLED) header.appendChild(el("button", {class:"btn btn-outline", onclick: openCourseAskAI}, [text("Ask AI")]));
     header.appendChild(el("button", {class:"btn btn-outline", onclick: openNoteModal}, [icon("note"), text("Add note")]));
+    header.appendChild(el("button", {class:"btn btn-outline", onclick: openTranscriptModal}, [icon("transcript"), text("Add transcript")]));
     header.appendChild(el("button", {class:"btn btn-primary", onclick: openCaptureChoice}, [icon("mic"), text("Add recording")]));
   }
 
@@ -674,6 +707,7 @@
   function renderContent(){
     var content = document.getElementById("content");
     content.innerHTML = "";
+    if (state.view === "home"){ renderHomeDashboard(content); return; }
     if (!state.currentCourseId){
       if (state.courses.length === 0){
         content.appendChild(el("div",{class:"empty-state"},[
@@ -721,6 +755,8 @@
     var list = el("div",{class:"entry-list"});
     items.forEach(function(e){
       var isLecture = e.type === "lecture";
+      var isTranscript = e.type === "transcript";
+      var iconName = isLecture ? "mic" : (isTranscript ? "transcript" : "note");
       var renameBtn = el("button",{class:"entry-action-btn", title:"Rename", type:"button", onclick: function(ev){
         ev.stopPropagation();
         var next = prompt("Rename this entry:", e.title || "");
@@ -731,7 +767,7 @@
         deleteEntry(e.id);
       }},[icon("trash")]);
       var card = el("div",{class:"entry-card", onclick: function(){ openEntry(e.id); }},[
-        el("div",{class:"entry-icon" + (isLecture?"":" note")},[icon(isLecture?"mic":"note")]),
+        el("div",{class:"entry-icon" + (isLecture?"":" note")},[icon(iconName)]),
         el("div",{class:"entry-main"},[
           el("div",{class:"entry-title"},[text(e.title || "Untitled")]),
           el("div",{class:"entry-sub mono"},[text(fmtDate(e.date) + (isLecture && e.durationSec ? " · " + fmtDuration(e.durationSec) : ""))]),
@@ -742,6 +778,35 @@
       list.appendChild(card);
     });
     content.appendChild(list);
+  }
+
+  function renderHomeDashboard(content){
+    if (state.courses.length === 0){
+      content.appendChild(el("div",{class:"empty-state"},[
+        el("h2",{},[text("Start your notebook")]),
+        el("div",{},[text("Add your first course to begin recording lectures and keeping notes.")]),
+        el("button",{class:"btn btn-primary", style:"margin-top:6px;", onclick: openCourseModal},[text("+ Add a course")])
+      ]));
+      return;
+    }
+    content.appendChild(el("div",{class:"empty-state", style:"padding:6px 4px 20px;"},[
+      el("h2",{},[text("Pick a course")]),
+      el("div",{},[text("Choose where you want to go.")])
+    ]));
+    var grid = el("div",{class:"entry-list"});
+    state.courses.forEach(function(c){
+      var meta = [c.code, c.term].filter(Boolean).join(" · ");
+      var card = el("div",{class:"entry-card", onclick: function(){ selectCourse(c.id); }},[
+        el("div",{class:"entry-icon note"},[icon("note")]),
+        el("div",{class:"entry-main"},[
+          el("div",{class:"entry-title"},[text(c.name)]),
+          el("div",{class:"entry-sub mono"},[text(meta || "Course")])
+        ])
+      ]);
+      grid.appendChild(card);
+    });
+    content.appendChild(grid);
+    content.appendChild(el("button",{class:"add-course-btn", style:"margin-top:14px; max-width:240px;", onclick: openCourseModal},[text("+ Add a course")]));
   }
 
   function renderTranscriptField(label, placeholder, getValue, setValue){
@@ -774,6 +839,37 @@
     ]));
     panel.appendChild(fileInput);
     panel.appendChild(ta);
+    return panel;
+  }
+
+  function renderSlidePicker(getFiles, setFiles){
+    var panel = el("div",{class:"panel"});
+    var listWrap = el("div",{style:"display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 2px;"});
+    function renderList(){
+      listWrap.innerHTML = "";
+      (getFiles() || []).forEach(function(f, idx){
+        var chip = el("div",{style:"display:flex; align-items:center; gap:6px; background:var(--surface-2); border:1px solid var(--border); border-radius:8px; padding:5px 6px 5px 10px; font-size:12.5px; max-width:220px;"},[
+          el("span",{style:"overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"},[text(f.name)]),
+          el("button",{class:"btn-ghost", style:"padding:2px;", type:"button", title:"Remove", onclick: function(){
+            var files = (getFiles() || []).slice(); files.splice(idx,1); setFiles(files); renderList();
+          }},[icon("trash")])
+        ]);
+        listWrap.appendChild(chip);
+      });
+    }
+    var fileInput = el("input",{type:"file", accept:"image/*,.pdf", multiple:"multiple"});
+    fileInput.addEventListener("change", function(){
+      var picked = Array.prototype.slice.call(fileInput.files || []);
+      if (!picked.length) return;
+      setFiles((getFiles() || []).concat(picked));
+      fileInput.value = "";
+      renderList();
+    });
+    panel.appendChild(el("div",{class:"panel-label"},[text("Slides (optional)")]));
+    panel.appendChild(el("div",{class:"rec-note", style:"margin-bottom:2px;"},[text("Attach slide images or PDFs now — they'll be saved with this recording once it's done.")]));
+    panel.appendChild(fileInput);
+    panel.appendChild(listWrap);
+    renderList();
     return panel;
   }
 
@@ -810,6 +906,11 @@
         function(v){ rec.pastedTranscript = v; }
       ));
 
+      panel.appendChild(renderSlidePicker(
+        function(){ return rec.slideFiles; },
+        function(v){ rec.slideFiles = v; }
+      ));
+
       panel.appendChild(el("div",{class:"rec-actions"},[
         el("button",{class:"btn btn-primary", disabled: rec.uploading, onclick: beginImportUpload},[text(rec.uploading ? "Uploading…" : "Save recording")]),
         el("button",{class:"btn btn-outline", disabled: rec.uploading, onclick: function(){ rec=null; backToList(); }},[text("Cancel")])
@@ -829,6 +930,10 @@
         "Paste text here, or upload a .txt file — it'll be placed before whatever gets recorded live, so the two read as one continuous transcript.",
         function(){ return rec.priorTranscript; },
         function(v){ rec.priorTranscript = v; }
+      ));
+      panel.appendChild(renderSlidePicker(
+        function(){ return rec.slideFiles; },
+        function(v){ rec.slideFiles = v; }
       ));
       panel.appendChild(el("div",{class:"rec-actions"},[
         el("button",{class:"btn btn-primary", onclick: beginCapture},[icon("mic"), text("Start recording")]),
@@ -888,6 +993,7 @@
     var e = state.entries.find(function(x){ return x.id === state.currentEntryId; });
     if (!e){ renderEmpty("Not found","This entry may have been deleted."); return; }
     var isLecture = e.type === "lecture";
+    var showTranscriptPanel = e.type === "lecture" || e.type === "transcript";
     content.appendChild(el("div",{class:"detail-back", onclick: backToList},[icon("back"), text("All entries")]));
     var titleInput = el("input",{class:"detail-title", value: e.title || ""});
     var saveTitle = debounce(function(){ updateEntry(e.id, {title: titleInput.value}); }, 600);
@@ -909,7 +1015,7 @@
       else playerRow.appendChild(el("div",{class:"rec-warn"},[text("Couldn't load the audio for this entry.")]));
     }
 
-    if (isLecture){
+    if (showTranscriptPanel){
       var tSaveDot = el("span",{class:"save-dot", id:"tDot"});
       var tArea = el("textarea",{placeholder:"Paste a transcript here, type your own, or upload a .txt file below."});
       tArea.value = e.transcript || "";
@@ -1073,6 +1179,90 @@
     root.innerHTML = "";
     root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
     setTimeout(function(){ titleInput.focus(); }, 0);
+  }
+
+  function openTranscriptModal(){
+    var root = document.getElementById("modalRoot");
+    var titleInput = el("input",{placeholder:"e.g. Transcript from Tuesday's lecture"});
+    var bodyInput = el("textarea",{rows:"8", placeholder:"Paste the transcript here, or upload a .txt file below."});
+    var fileInput = el("input",{type:"file", accept:".txt,text/plain", style:"display:none;"});
+    fileInput.addEventListener("change", function(){
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(){
+        var incoming = String(reader.result || "");
+        var replace = true;
+        if ((bodyInput.value || "").trim()){
+          replace = confirm("Replace the existing text with this file's contents? Click Cancel to append instead.");
+        }
+        bodyInput.value = replace ? incoming : (bodyInput.value + "\n\n" + incoming);
+      };
+      reader.onerror = function(){ alert("Couldn't read that file."); };
+      reader.readAsText(file);
+      fileInput.value = "";
+    });
+    var uploadBtn = el("button",{class:"btn btn-outline", type:"button", style:"padding:4px 10px; font-size:12.5px;", onclick: function(){ fileInput.click(); }},[text("Upload .txt file")]);
+    var modal = el("div",{class:"modal"},[
+      el("h3",{},[text("Add a transcript")]),
+      el("div",{class:"field"},[el("label",{},[text("Title")]), titleInput]),
+      el("div",{class:"field"},[
+        el("label",{style:"display:flex; align-items:center; justify-content:space-between;"},[text("Transcript"), uploadBtn]),
+        fileInput,
+        bodyInput
+      ]),
+      el("div",{class:"modal-actions"},[
+        el("button",{class:"btn btn-outline", onclick: closeModal},[text("Cancel")]),
+        el("button",{class:"btn btn-primary", onclick: function(){
+          if (!bodyInput.value.trim()){ bodyInput.focus(); return; }
+          addTranscriptEntry(titleInput.value.trim(), bodyInput.value);
+          closeModal();
+        }},[text("Save transcript")])
+      ])
+    ]);
+    root.innerHTML = "";
+    root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
+    setTimeout(function(){ titleInput.focus(); }, 0);
+  }
+
+  function openCourseAskAI(){
+    var root = document.getElementById("modalRoot");
+    var course = state.courses.find(function(c){ return c.id === state.currentCourseId; });
+    var contextText = state.entries.map(function(e){
+      var parts = [];
+      if (e.transcript) parts.push(e.transcript);
+      if (e.notesText) parts.push(e.notesText);
+      return parts.join("\n\n");
+    }).filter(Boolean).join("\n\n---\n\n");
+    var answerBox = el("div",{class:"ai-answer", style:"display:none; margin-top:12px;"});
+    var input = el("input",{placeholder:"e.g. What have we covered so far this course?"});
+    var askBtn = el("button",{class:"btn btn-primary", onclick: function(){ runAsk(); }},[text("Ask")]);
+    function runAsk(){
+      var q = input.value.trim();
+      if (!q) return;
+      askBtn.setAttribute("disabled","disabled"); askBtn.textContent = "Thinking…";
+      answerBox.style.display = ""; answerBox.textContent = "…";
+      askAI(q, { transcript: contextText }).then(function(answer){
+        answerBox.textContent = answer;
+      }).catch(function(err){
+        answerBox.textContent = "Couldn't get an answer (" + (err && err.message || err) + ").";
+      }).then(function(){
+        askBtn.removeAttribute("disabled"); askBtn.textContent = "Ask";
+      });
+    }
+    input.addEventListener("keydown", function(ev){ if (ev.key === "Enter") runAsk(); });
+    var modal = el("div",{class:"modal", style:"max-width:520px;"},[
+      el("h3",{},[text("Ask AI about " + (course ? course.name : "this course"))]),
+      el("div",{class:"rec-note", style:"margin-bottom:14px;"},[text(contextText ? "Draws on the transcripts and notes from every entry in this course." : "This course doesn't have any transcripts or notes yet — add some first for the AI to work with.")]),
+      el("div",{style:"display:flex; gap:8px;"},[input, askBtn]),
+      answerBox,
+      el("div",{class:"modal-actions"},[
+        el("button",{class:"btn btn-outline", onclick: closeModal},[text("Close")])
+      ])
+    ]);
+    root.innerHTML = "";
+    root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
+    setTimeout(function(){ input.focus(); }, 0);
   }
 })();
 </script>
