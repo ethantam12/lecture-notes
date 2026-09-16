@@ -79,6 +79,13 @@
   .entry-title{ font-weight:700; font-size:14.5px; margin-bottom:2px; }
   .entry-sub{ font-family:"IBM Plex Mono", monospace; font-size:11px; color:var(--faint); }
   .entry-snippet{ color:var(--muted); font-size:13px; margin-top:5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .entry-actions{ display:flex; gap:2px; margin-left:auto; flex:none; opacity:0; transition:opacity .12s; }
+  .entry-card:hover .entry-actions, .entry-actions:focus-within{ opacity:1; }
+  .entry-action-btn{ background:none; border:none; cursor:pointer; color:var(--muted); padding:7px; border-radius:7px; display:flex; }
+  .entry-action-btn:hover{ background:var(--surface-2); color:var(--ink); }
+  .entry-action-btn.danger:hover{ background:var(--danger-soft); color:var(--danger); }
+  .list-toolbar{ display:flex; align-items:center; justify-content:flex-end; margin-bottom:10px; }
+  .sort-select{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:6px 10px; font-size:12.5px; color:var(--muted); font-family:inherit; }
   .detail-back{ display:inline-flex; align-items:center; gap:6px; color:var(--muted); cursor:pointer; font-size:13px; font-weight:600; margin-bottom:14px; }
   .detail-back:hover{ color:var(--accent); }
   .detail-title-row{ display:flex; align-items:flex-start; gap:12px; margin-bottom:6px; }
@@ -257,6 +264,7 @@
     currentEntryId: null,
     view: "list",
     searchTerm: "",
+    sortBy: "newest",
     unsubCourses: null,
     unsubEntries: null
   };
@@ -314,7 +322,8 @@
       search: '<circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.3-4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
       trash: '<path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2m2 0v13a1 1 0 01-1 1H8a1 1 0 01-1-1V7h10z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
       back: '<path d="M15 6l-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
-      upload: '<path d="M12 16V4M12 4l-4.5 4.5M12 4l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>'
+      upload: '<path d="M12 16V4M12 4l-4.5 4.5M12 4l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+      pencil: '<path d="M4 20h4l10.5-10.5a2 2 0 000-2.83l-1.17-1.17a2 2 0 00-2.83 0L4 16v4z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'
     };
     var svg = document.createElementNS("http://www.w3.org/2000/svg","svg");
     svg.setAttribute("width","16"); svg.setAttribute("height","16"); svg.setAttribute("viewBox","0 0 24 24"); svg.setAttribute("fill","none");
@@ -684,6 +693,23 @@
         return (e.title||"").toLowerCase().indexOf(q) > -1 || (e.transcript||"").toLowerCase().indexOf(q) > -1 || (e.notesText||"").toLowerCase().indexOf(q) > -1;
       });
     }
+    if (state.sortBy === "oldest"){
+      items.sort(function(a,b){ return (a.date||"").localeCompare(b.date||""); });
+    } else if (state.sortBy === "title"){
+      items.sort(function(a,b){ return (a.title||"").toLowerCase().localeCompare((b.title||"").toLowerCase()); });
+    } else {
+      items.sort(function(a,b){ return (b.date||"").localeCompare(a.date||""); });
+    }
+    var toolbar = el("div",{class:"list-toolbar"});
+    var sortSelect = el("select",{class:"sort-select"},[
+      el("option",{value:"newest"},[text("Newest first")]),
+      el("option",{value:"oldest"},[text("Oldest first")]),
+      el("option",{value:"title"},[text("Title A–Z")])
+    ]);
+    sortSelect.value = state.sortBy;
+    sortSelect.addEventListener("change", function(){ state.sortBy = sortSelect.value; renderContent(); });
+    toolbar.appendChild(sortSelect);
+    content.appendChild(toolbar);
     if (items.length === 0){
       content.appendChild(el("div",{class:"empty-state"},[
         el("h2",{},[text(state.entries.length ? "No matches" : "Nothing here yet")]),
@@ -694,13 +720,23 @@
     var list = el("div",{class:"entry-list"});
     items.forEach(function(e){
       var isLecture = e.type === "lecture";
+      var renameBtn = el("button",{class:"entry-action-btn", title:"Rename", type:"button", onclick: function(ev){
+        ev.stopPropagation();
+        var next = prompt("Rename this entry:", e.title || "");
+        if (next !== null && next.trim()) updateEntry(e.id, {title: next.trim()});
+      }},[icon("pencil")]);
+      var deleteBtn = el("button",{class:"entry-action-btn danger", title:"Delete", type:"button", onclick: function(ev){
+        ev.stopPropagation();
+        deleteEntry(e.id);
+      }},[icon("trash")]);
       var card = el("div",{class:"entry-card", onclick: function(){ openEntry(e.id); }},[
         el("div",{class:"entry-icon" + (isLecture?"":" note")},[icon(isLecture?"mic":"note")]),
         el("div",{class:"entry-main"},[
           el("div",{class:"entry-title"},[text(e.title || "Untitled")]),
           el("div",{class:"entry-sub mono"},[text(fmtDate(e.date) + (isLecture && e.durationSec ? " · " + fmtDuration(e.durationSec) : ""))]),
           el("div",{class:"entry-snippet"},[text((e.notesText || e.transcript || "").slice(0,140))])
-        ])
+        ]),
+        el("div",{class:"entry-actions"},[renameBtn, deleteBtn])
       ]);
       list.appendChild(card);
     });
