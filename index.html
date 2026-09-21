@@ -12,14 +12,14 @@
     --bg:#eef0f6; --surface:#ffffff; --surface-2:#f5f6fb; --ink:#1b2030;
     --muted:#5c6377; --faint:#8b93a7; --border:#dadfec; --accent:#2d4fd6;
     --accent-ink:#ffffff; --accent-soft:#e3e8fc; --danger:#c93a2c; --danger-soft:#f8e2df;
-    --success:#1f8f63; --success-soft:#e0f3ea; --shadow: 0 1px 2px rgba(27,32,48,.04), 0 8px 24px rgba(27,32,48,.06);
+    --success:#1f8f63; --success-soft:#e0f3ea; --warn:#a8710a; --warn-soft:#fbeed2; --shadow: 0 1px 2px rgba(27,32,48,.04), 0 8px 24px rgba(27,32,48,.06);
   }
   @media (prefers-color-scheme: dark){
     :root:not([data-theme="light"]){
       --bg:#12141c; --surface:#1a1d29; --surface-2:#20232f; --ink:#e8eaf2;
       --muted:#9aa1b4; --faint:#6b7185; --border:#2b2f3f; --accent:#7c93ff;
       --accent-ink:#10142a; --accent-soft:#242c4d; --danger:#ff8a76; --danger-soft:#3a2320;
-      --success:#57d19c; --success-soft:#1e3329; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+      --success:#57d19c; --success-soft:#1e3329; --warn:#e3b341; --warn-soft:#3a2f13; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
     }
   }
   *{box-sizing:border-box;}
@@ -109,6 +109,13 @@
   @keyframes pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.35; } }
   .rec-timer{ font-family:"IBM Plex Mono", monospace; font-size:30px; font-weight:500; }
   .rec-note{ color:var(--faint); font-size:12.5px; }
+  .status-bar{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .status-pill{ display:inline-flex; align-items:center; gap:8px; padding:6px 11px; border-radius:999px; background:var(--surface-2); border:1px solid var(--border); font-size:12px; color:var(--muted); }
+  .status-pill.good{ color:var(--success); border-color:var(--success); }
+  .status-pill.warn{ color:var(--warn); border-color:var(--warn); }
+  .status-pill.bad{ color:var(--danger); border-color:var(--danger); }
+  .mic-level-track{ width:56px; height:6px; border-radius:3px; background:var(--border); overflow:hidden; display:inline-block; }
+  .mic-level-fill{ height:100%; width:0%; background:currentColor; transition:width .12s linear; }
   .transcript-label{ font-family:"IBM Plex Mono", monospace; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--faint); margin-bottom:6px; }
   .rec-transcript{ background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:14px; height:110px; overflow-y:auto; color:var(--muted); font-size:13px; line-height:1.6; margin-bottom:20px; }
   .rec-transcript .final{ color:var(--ink); }
@@ -314,6 +321,18 @@
       });
     });
   }
+  function generateSummaryNotes(transcript){
+    return fetch(window.aiConfig.workerUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "summarize", transcript: transcript || "" })
+    }).then(function(res){
+      return res.json().then(function(data){
+        if (!res.ok) throw new Error(data && data.error || "Request failed");
+        return data.notes || "";
+      });
+    });
+  }
   function transcribeAudio(audioUrl){
     return fetch(window.aiConfig.workerUrl, {
       method: "POST",
@@ -352,7 +371,8 @@
     searchTerm: "",
     sortBy: "newest",
     unsubCourses: null,
-    unsubEntries: null
+    unsubEntries: null,
+    autoSummaryPending: {}
   };
   var rec = null;
   var AUDIO_BITRATE = 64000; // higher-quality audio so both live captions and AI transcription have more to work with — still stretches the free 1GB storage tier to ~35 hours of lectures
@@ -552,6 +572,35 @@
     Promise.all([job].concat(slideJobs)).then(function(){ return db.doc("courses/" + state.currentCourseId + "/entries/" + id).delete(); }).then(backToList);
   }
 
+  // Automatically turns a just-saved lecture's transcript into a first draft
+  // of notes, so the student doesn't have to ask for it. Runs in the
+  // background right after a recording (live or imported) is saved.
+  function runAutoSummary(entryId, transcript){
+    generateSummaryNotes(transcript).then(function(notes){
+      delete state.autoSummaryPending[entryId];
+      finishAutoSummary(entryId, notes, null);
+    }).catch(function(err){
+      delete state.autoSummaryPending[entryId];
+      finishAutoSummary(entryId, null, err);
+    });
+  }
+  function finishAutoSummary(entryId, notes, err){
+    if (state.view === "detail" && state.currentEntryId === entryId){
+      var statusEl = document.getElementById("notesPanelStatus");
+      if (statusEl) statusEl.textContent = (err || !notes) ? "Couldn't generate an automatic summary — feel free to write your own notes, or try Ask AI." : "";
+    }
+    if (err || !notes) return;
+    // Don't clobber notes the student already wrote (or started writing)
+    // while the summary was being generated in the background.
+    var entry = state.entries.find(function(x){ return x.id === entryId; });
+    var alreadyHasNotes = entry && (entry.notesText || "").trim();
+    var box = document.getElementById("notesArea");
+    var userTyping = box && (document.activeElement === box || (box.value || "").trim());
+    if (alreadyHasNotes || userTyping) return;
+    updateEntry(entryId, { notesText: notes });
+    if (box) box.value = notes;
+  }
+
   // ---------------------------------------------------------------
   // Slides (uploaded per entry, stored alongside recordings/notes)
   // ---------------------------------------------------------------
@@ -601,7 +650,9 @@
       finalTranscript: "", interimTranscript: "", recognition: null, priorTranscript: "",
       supportsSpeech: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
       mimeType: pickMimeType(), error: null, slideFiles: [], lastResultAt: 0, watchdogInt: null,
-      aiTranscript: [], aiChunkFallback: [], aiChunkIndex: 0, aiChunking: false, currentChunkRecorder: null, pendingChunkPromises: []
+      aiTranscript: [], aiChunkFallback: [], aiChunkIndex: 0, aiChunking: false, currentChunkRecorder: null, pendingChunkPromises: [],
+      audioCtx: null, analyser: null, micData: null, micLevel: 0, lastLoudAt: 0, statusInt: null,
+      lastChunkOk: null, lastChunkMs: 0, chunkFailStreak: 0
     };
     renderContent();
   }
@@ -636,6 +687,7 @@
       }, 500);
       if (rec.supportsSpeech) startRecognition();
       if (AI_ENABLED) startAiChunking();
+      startStatusMonitoring();
       renderContent();
     }).catch(function(err){
       rec.error = "Couldn't access your microphone (" + (err && err.name || "error") + "). Check permissions and try again.";
@@ -648,6 +700,7 @@
     clearInterval(rec.timerInt);
     stopRecognition();
     stopAiChunking();
+    stopStatusMonitoring();
     if (discard){
       if (rec.stream) rec.stream.getTracks().forEach(function(t){ t.stop(); });
       if (rec.recorder && rec.recorder.state !== "inactive"){ rec.recorder.onstop = function(){}; rec.recorder.stop(); }
@@ -714,8 +767,11 @@
     }).then(function(){
       return Promise.all(slideFiles.map(function(f){ return uploadSlide({id: entryId}, f).catch(function(){}); }));
     }).then(function(){
+      var willSummarize = AI_ENABLED && !!transcript.trim();
+      if (willSummarize) state.autoSummaryPending[entryId] = true;
       rec = null;
       openEntry(entryId);
+      if (willSummarize) runAutoSummary(entryId, transcript);
     }).catch(function(err){
       rec.uploading = false;
       rec.error = "Couldn't save the recording (" + (err && err.message || err) + "). Try again.";
@@ -819,6 +875,84 @@
   }
 
   // ---------------------------------------------------------------
+  // Live status bar: a real mic-level meter (via the Web Audio API,
+  // reading the same stream the recorder uses) so you can visually see
+  // sound is being picked up, plus a rough read on connection quality
+  // based on whether the AI re-transcription requests are going through
+  // quickly. Both update a few times a second while recording.
+  // ---------------------------------------------------------------
+  function startStatusMonitoring(){
+    if (!rec) return;
+    try{
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC && rec.stream){
+        rec.audioCtx = new AC();
+        var source = rec.audioCtx.createMediaStreamSource(rec.stream);
+        rec.analyser = rec.audioCtx.createAnalyser();
+        rec.analyser.fftSize = 512;
+        source.connect(rec.analyser);
+        rec.micData = new Uint8Array(rec.analyser.frequencyBinCount);
+      }
+    }catch(e){
+      rec.analyser = null; // mic meter just won't be shown in this browser
+    }
+    rec.micLevel = 0;
+    rec.statusInt = setInterval(function(){
+      if (!rec) return;
+      if (rec.analyser && rec.micData){
+        rec.analyser.getByteTimeDomainData(rec.micData);
+        var sum = 0;
+        for (var i = 0; i < rec.micData.length; i++){
+          var v = (rec.micData[i] - 128) / 128;
+          sum += v * v;
+        }
+        var rms = Math.sqrt(sum / rec.micData.length);
+        rec.micLevel = Math.min(1, rms * 4); // speech RMS is usually small — scale up so the meter reads usefully
+        if (rec.micLevel > 0.06) rec.lastLoudAt = Date.now();
+      }
+      updateStatusBarUI();
+    }, 400);
+  }
+  function stopStatusMonitoring(){
+    if (rec && rec.statusInt){ clearInterval(rec.statusInt); rec.statusInt = null; }
+    if (rec && rec.audioCtx){ try{ rec.audioCtx.close(); }catch(e){} rec.audioCtx = null; rec.analyser = null; }
+  }
+  function micStatusLabel(){
+    if (!rec || !rec.analyser) return { label: "Mic meter unavailable in this browser", cls: "" };
+    var level = rec.micLevel || 0;
+    var recentlyLoud = rec.lastLoudAt && (Date.now() - rec.lastLoudAt < 2500);
+    if (level > 0.55) return { label: "Very loud — you can move back a little", cls: "warn" };
+    if (recentlyLoud) return { label: "Hearing you clearly", cls: "good" };
+    if (level > 0.02) return { label: "Picking up faint sound", cls: "warn" };
+    return { label: "No sound detected — check your mic", cls: "bad" };
+  }
+  function connectionStatusLabel(){
+    if (typeof navigator !== "undefined" && navigator.onLine === false){
+      return { label: "Offline — audio keeps recording locally and will save once you're back online", cls: "bad" };
+    }
+    if (!AI_ENABLED) return { label: "Online", cls: "good" };
+    if (!rec || rec.aiChunkIndex === 0) return { label: "Checking connection…", cls: "" };
+    if ((rec.chunkFailStreak || 0) >= 2) return { label: "Weak connection — using the live transcript for some segments", cls: "warn" };
+    if (rec.lastChunkMs && rec.lastChunkMs > 15000) return { label: "Slow connection — AI re-checks are taking a while", cls: "warn" };
+    return { label: "Good connection", cls: "good" };
+  }
+  function updateStatusBarUI(){
+    if (!rec) return;
+    var m = micStatusLabel();
+    var micText = document.getElementById("micStatus");
+    var micPill = document.getElementById("micStatusPill");
+    if (micText) micText.textContent = m.label;
+    if (micPill) micPill.className = "status-pill " + m.cls;
+    var levelBar = document.getElementById("micLevelBar");
+    if (levelBar) levelBar.style.width = Math.round(Math.min(1, rec.micLevel || 0) * 100) + "%";
+    var n = connectionStatusLabel();
+    var netText = document.getElementById("netStatus");
+    var netPill = document.getElementById("netStatusPill");
+    if (netText) netText.textContent = n.label;
+    if (netPill) netPill.className = "status-pill " + n.cls;
+  }
+
+  // ---------------------------------------------------------------
   // AI-powered live transcription: the browser's own live captions
   // (above) are a real-time best-effort guess. Underneath, a second,
   // independent MediaRecorder on the same microphone stream is stopped
@@ -856,15 +990,27 @@
   // One quick retry clears up most of those before falling back to the live
   // Web Speech text captured for this same stretch (see scheduleNextAiChunk).
   function transcribeChunk(blob, idx){
+    var startedAt = Date.now();
     var p = transcribeChunkAttempt(blob).catch(function(){
       return new Promise(function(resolve){ setTimeout(resolve, 1500); }).then(function(){
         return transcribeChunkAttempt(blob);
       });
     }).then(function(t){
-      if (rec) rec.aiTranscript[idx] = t.trim();
+      if (rec){
+        rec.aiTranscript[idx] = t.trim();
+        rec.lastChunkOk = true;
+        rec.lastChunkMs = Date.now() - startedAt;
+        rec.chunkFailStreak = 0;
+        updateStatusBarUI();
+      }
     }).catch(function(){
       // Both attempts failed — buildFinalTranscript() falls back to the
       // Web Speech text captured for this chunk's time window instead.
+      if (rec){
+        rec.lastChunkOk = false;
+        rec.chunkFailStreak = (rec.chunkFailStreak || 0) + 1;
+        updateStatusBarUI();
+      }
     });
     if (rec) rec.pendingChunkPromises = (rec.pendingChunkPromises || []).concat([p]);
     return p;
@@ -934,7 +1080,14 @@
       });
     }).then(function(){
       return Promise.all(slideFiles.map(function(f){ return uploadSlide({id: entryId}, f).catch(function(){}); }));
-    }).then(function(){ rec = null; openEntry(entryId); }).catch(function(err){
+    }).then(function(){
+      var transcript = (rec.pastedTranscript || "").trim();
+      var willSummarize = AI_ENABLED && !!transcript;
+      if (willSummarize) state.autoSummaryPending[entryId] = true;
+      rec = null;
+      openEntry(entryId);
+      if (willSummarize) runAutoSummary(entryId, transcript);
+    }).catch(function(err){
       rec.uploading = false; rec.error = "Couldn't upload that file (" + (err && err.message || err) + "). Try again.";
       renderContent();
     });
@@ -1254,7 +1407,18 @@
       el("div",{class:"rec-timer mono", id:"recTimer"},[text(fmtTimer(rec.elapsedSec))]),
       el("div",{class:"rec-note"},[text(rec.uploading ? "Saving…" : (rec.finishing ? "Finishing up…" : "Recording"))])
     ]));
-    if (AI_ENABLED) panel.appendChild(el("div",{class:"rec-note", style:"margin-bottom:10px;"},[text("AI is also quietly re-checking the actual audio every 30 seconds for extra accuracy — that's what gets saved.")]));
+    var micNow = micStatusLabel();
+    var netNow = connectionStatusLabel();
+    panel.appendChild(el("div",{class:"status-bar"},[
+      el("div",{class:"status-pill " + micNow.cls, id:"micStatusPill"},[
+        el("span",{id:"micStatus"},[text(micNow.label)]),
+        el("div",{class:"mic-level-track"},[ el("div",{class:"mic-level-fill", id:"micLevelBar"}) ])
+      ]),
+      el("div",{class:"status-pill " + netNow.cls, id:"netStatusPill"},[
+        el("span",{id:"netStatus"},[text(netNow.label)])
+      ])
+    ]));
+    if (AI_ENABLED) panel.appendChild(el("div",{class:"rec-note", style:"margin-bottom:10px;"},[text("AI is also quietly re-checking the actual audio every 30 seconds for extra accuracy, and will draft your notes automatically once you stop and save.")]));
     panel.appendChild(el("div",{class:"transcript-label"},[text("Full transcript so far")]));
     var transcriptBox = el("div",{class:"rec-transcript", id:"recTranscript"});
     transcriptBox.innerHTML = '<span class="final">' + esc(rec.finalTranscript) + '</span>' + esc(rec.interimTranscript || (rec.supportsSpeech ? "" : "(no live transcript in this browser)"));
@@ -1376,11 +1540,13 @@
     }
 
     var nSaveDot = el("span",{class:"save-dot", id:"nDot"});
-    var nArea = el("textarea",{placeholder:"Write your notes here…"});
+    var nArea = el("textarea",{placeholder:"Write your notes here…", id:"notesArea"});
     nArea.value = e.notesText || "";
     var saveN = debounce(function(){ updateEntry(e.id, {notesText: nArea.value}); flashDot("nDot"); }, 700);
     nArea.addEventListener("input", saveN);
-    content.appendChild(el("div",{class:"panel"},[ el("div",{class:"panel-label"},[text(isLecture ? "Your notes" : "Note"), nSaveDot]), nArea ]));
+    var notesStatus = el("div",{class:"rec-note", id:"notesPanelStatus", style:"margin-top:6px;"});
+    if (isLecture && state.autoSummaryPending[e.id]) notesStatus.appendChild(text("Generating an AI summary of this lecture…"));
+    content.appendChild(el("div",{class:"panel"},[ el("div",{class:"panel-label"},[text(isLecture ? "Your notes" : "Note"), nSaveDot]), nArea, notesStatus ]));
 
     renderSlidesPanel(content, e);
     if (AI_ENABLED) renderAskAIPanel(content, e);
