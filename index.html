@@ -1090,7 +1090,13 @@
         if (combined.length) t = trimChunkOverlap(combined[combined.length-1], t);
         if (t) combined.push(t);
       }
-      if (combined.length) return combined.join("\n\n");
+      // Joined with a single space rather than a paragraph break: each piece
+      // is just a fixed 30-second slice of one continuous lecture, not a
+      // natural paragraph boundary, so stitching them with blank lines made
+      // the raw transcript read as choppy, disconnected chunks. The
+      // automatic clean-up pass (see generateCleanTranscript) still turns
+      // this into properly paragraphed text afterward.
+      if (combined.length) return combined.join(" ");
     }
     return (rec && rec.finalTranscript || "").trim();
   }
