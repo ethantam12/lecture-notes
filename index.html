@@ -452,6 +452,23 @@
   .save-tracker.cloud{ background:var(--accent-soft); }
   .stale-notice{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:var(--warn-soft); color:var(--warn); border-radius:8px; padding:9px 12px; font-size:13px; margin-bottom:14px; }
   .stale-notice span{ flex:1; min-width:180px; }
+
+  /* Sections and selecting */
+  .content{ overflow:visible; } /* lets the selection bar stay in view while scrolling */
+  .section-bar{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:10px; }
+  .section-chip{ background:var(--surface); border:1px solid var(--border); border-radius:999px; padding:4px 11px; font-size:12.5px; font-weight:500; color:var(--muted); cursor:pointer; }
+  .section-chip:hover{ color:var(--ink); border-color:var(--faint); }
+  .section-chip.on{ background:var(--accent-soft); border-color:transparent; color:var(--ink); }
+  .section-tools{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:10px; }
+  .list-toolbar{ justify-content:space-between; gap:8px; }
+  .entry-card.selected{ background:var(--accent-soft); }
+  .entry-check{ width:18px; height:18px; flex:none; accent-color:var(--accent); cursor:pointer; }
+  .entry-tag{ color:var(--accent); font-weight:500; }
+  .selection-bar{ position:sticky; bottom:12px; z-index:9; display:flex; flex-wrap:wrap; align-items:center; gap:8px; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:10px 12px; margin-top:14px; box-shadow:0 6px 20px rgba(40,30,10,.14); }
+  .selection-count{ font-weight:600; font-size:13.5px; margin-right:auto; }
+  .section-pick{ display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }
+  .section-pick button{ text-align:left; justify-content:flex-start; }
+  .notes-choice{ display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:10px; margin-bottom:14px; }
 </style>
 </head>
 <body>
@@ -1129,6 +1146,10 @@
     unsubEntries: null,
     autoSummaryPending: {},
     autoTranscribePending: {},
+    selecting: false,
+    selectedIds: [],
+    sectionFilter: null,
+    bulkBusy: false,
     trackers: [],
     detailAudio: null,
     pendingSeek: null,
@@ -1602,6 +1623,9 @@
     state.currentEntryId = null;
     state.view = "list";
     state.searchTerm = "";
+    state.selecting = false;
+    state.selectedIds = [];
+    state.sectionFilter = null;
     state.entries = [];
     lsSet("lecnotes.lastCourse", id);
     renderSidebar(); renderHeader();
@@ -1636,12 +1660,13 @@
   // ---------------------------------------------------------------
   // Entries
   // ---------------------------------------------------------------
-  function addNoteEntry(title, bodyText){
+  function addNoteEntry(title, bodyText, sectionId){
     var courseId = state.currentCourseId;
     if (!courseId) return;
     db.collection("courses/" + courseId + "/entries").add({
       type: "note", title: title || "Untitled note", date: nowIso(),
-      notesText: bodyText || "", transcript: "", audioPath: null, slidePaths: [], createdAt: nowIso()
+      notesText: bodyText || "", transcript: "", audioPath: null, slidePaths: [], createdAt: nowIso(),
+      sectionIds: sectionId ? [sectionId] : []
     }).then(function(ref){ openEntry(ref.id); });
   }
   function addTranscriptEntry(title, transcriptText){
@@ -1682,15 +1707,19 @@
     if (!state.currentCourseId) return;
     db.doc("courses/" + state.currentCourseId + "/entries/" + id).update(patch).catch(function(){});
   }
+  // Removes an entry's stored files, then the entry itself.
+  function removeEntryCompletely(courseId, e){
+    var job = e.audioPath ? removeFile(e.audioPath).catch(function(){}) : Promise.resolve();
+    var pdfJob = e.notesPdfPath ? removeFile(e.notesPdfPath).catch(function(){}) : Promise.resolve();
+    removeFile(embeddingPath(courseId, e.id)).catch(function(){});
+    var slideJobs = (e.slidePaths || []).map(function(p){ return removeFile(p).catch(function(){}); });
+    return Promise.all([job, pdfJob].concat(slideJobs)).then(function(){ return db.doc("courses/" + courseId + "/entries/" + e.id).delete(); });
+  }
   function deleteEntry(id){
     var e = state.entries.find(function(x){ return x.id === id; });
     if (!e) return;
     if (!confirm('Delete "' + (e.title || "this entry") + '"? This can\'t be undone.')) return;
-    var job = e.audioPath ? removeFile(e.audioPath).catch(function(){}) : Promise.resolve();
-    var pdfJob = e.notesPdfPath ? removeFile(e.notesPdfPath).catch(function(){}) : Promise.resolve();
-    removeFile(embeddingPath(state.currentCourseId, id)).catch(function(){});
-    var slideJobs = (e.slidePaths || []).map(function(p){ return removeFile(p).catch(function(){}); });
-    Promise.all([job, pdfJob].concat(slideJobs)).then(function(){ return db.doc("courses/" + state.currentCourseId + "/entries/" + id).delete(); }).then(backToList);
+    removeEntryCompletely(state.currentCourseId, e).then(backToList);
   }
 
   // Automatically turns a just-saved lecture's transcript into a first draft
@@ -3085,7 +3114,13 @@
     if (state.view === "recording"){ renderRecordingPanel(content); return; }
     if (state.view === "detail"){ renderDetail(content); return; }
 
+    var sections = currentSections();
+    if (state.sectionFilter && !sections.some(function(s){ return s.id === state.sectionFilter; })) state.sectionFilter = null;
+    state.selectedIds = state.selectedIds.filter(function(id){ return state.entries.some(function(e){ return e.id === id; }); });
     var items = state.entries.slice();
+    if (state.sectionFilter){
+      items = items.filter(function(e){ return (e.sectionIds || []).indexOf(state.sectionFilter) > -1; });
+    }
     if (state.searchTerm.trim()){
       var q = state.searchTerm.trim().toLowerCase();
       items = items.filter(function(e){
@@ -3107,12 +3142,20 @@
     ]);
     sortSelect.value = state.sortBy;
     sortSelect.addEventListener("change", function(){ state.sortBy = sortSelect.value; renderContent(); });
+    toolbar.appendChild(state.entries.length ? el("button",{class:"btn btn-outline", id:"selectModeBtn", type:"button", onclick: function(){
+      state.selecting = !state.selecting;
+      state.selectedIds = [];
+      renderContent();
+    }},[text(state.selecting ? "Cancel" : "Select")]) : el("span",{}));
     toolbar.appendChild(sortSelect);
     content.appendChild(toolbar);
+    renderSectionBar(content, sections);
+    state.visibleIds = items.map(function(e){ return e.id; });
     if (items.length === 0){
+      var inSection = !!state.sectionFilter && !state.searchTerm.trim();
       content.appendChild(el("div",{class:"empty-state"},[
-        el("h2",{},[text(state.entries.length ? "No matches" : "Nothing here yet")]),
-        el("div",{},[text(state.entries.length ? "Try a different search." : "Record a lecture or add a note to get started with this course.")]),
+        el("h2",{},[text(inSection ? "Nothing in this section yet" : (state.entries.length ? "No matches" : "Nothing here yet"))]),
+        el("div",{},[text(inSection ? "Choose All, select some lectures, and add them here." : (state.entries.length ? "Try a different search." : "Record a lecture or add a note to get started with this course."))]),
         state.entries.length ? null : el("button",{class:"btn btn-primary", style:"margin-top:6px;", onclick: openCaptureChoice},[icon("mic"), text("Record a lecture")])
       ]));
       return;
@@ -3129,18 +3172,287 @@
         ev.stopPropagation();
         deleteEntry(e.id);
       }},[icon("trash")]);
-      var card = el("div",{class:"entry-card", onclick: function(){ openEntry(e.id); }},[
+      var isSelected = state.selectedIds.indexOf(e.id) > -1;
+      var check = null;
+      if (state.selecting){
+        check = el("input",{class:"entry-check", type:"checkbox", "aria-label":"Select " + (e.title || "Untitled"), onclick: function(ev){ ev.stopPropagation(); toggleSelected(e.id, card, check); }});
+        check.checked = isSelected;
+      }
+      var tags = sections.filter(function(s){ return (e.sectionIds || []).indexOf(s.id) > -1; }).map(function(s){ return s.name; });
+      var card = el("div",{class:"entry-card" + (isSelected ? " selected" : ""), onclick: function(){
+        if (state.selecting) toggleSelected(e.id, card, check);
+        else openEntry(e.id);
+      }},[
+        check,
         dateTile(e.date),
         el("div",{class:"entry-main"},[
           el("div",{class:"entry-title"},[text(e.title || "Untitled")]),
-          el("div",{class:"entry-sub mono"},[text(fmtDate(e.date) + (isLecture && e.durationSec ? " · " + fmtDuration(e.durationSec) : ""))]),
+          el("div",{class:"entry-sub mono"},[
+            text(fmtDate(e.date) + (isLecture && e.durationSec ? " · " + fmtDuration(e.durationSec) : "")),
+            tags.length ? el("span",{class:"entry-tag"},[text(" · " + tags.join(", "))]) : null
+          ]),
           el("div",{class:"entry-snippet"},[text(previewText(e))])
         ]),
-        el("div",{class:"entry-actions"},[renameBtn, deleteBtn])
+        state.selecting ? null : el("div",{class:"entry-actions"},[renameBtn, deleteBtn])
       ]);
       list.appendChild(card);
     });
     content.appendChild(list);
+    if (state.selecting){
+      content.appendChild(el("div",{class:"selection-bar", id:"selectionBar"}));
+      drawSelectionBar();
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Sections, selecting several lectures, and combined notes
+  // ---------------------------------------------------------------
+  function currentCourse(){ return state.courses.find(function(c){ return c.id === state.currentCourseId; }); }
+  function currentSections(){
+    var course = currentCourse();
+    return (course && Array.isArray(course.sections)) ? course.sections : [];
+  }
+  function selectedEntries(){
+    return state.entries.filter(function(e){ return state.selectedIds.indexOf(e.id) > -1; });
+  }
+  function toggleSelected(id, card, check){
+    var at = state.selectedIds.indexOf(id);
+    if (at > -1) state.selectedIds.splice(at, 1); else state.selectedIds.push(id);
+    var on = at === -1;
+    card.classList.toggle("selected", on);
+    if (check) check.checked = on;
+    drawSelectionBar();
+  }
+  function drawSelectionBar(){
+    var bar = document.getElementById("selectionBar");
+    if (!bar) return;
+    bar.innerHTML = "";
+    var count = state.selectedIds.length;
+    var visible = state.visibleIds || [];
+    var allOn = visible.length > 0 && visible.every(function(id){ return state.selectedIds.indexOf(id) > -1; });
+    var none = count === 0 || state.bulkBusy;
+    bar.appendChild(el("div",{class:"selection-count"},[text(state.bulkBusy ? "Working…" : count + " selected")]));
+    bar.appendChild(el("button",{class:"btn btn-ghost", type:"button", disabled: state.bulkBusy, onclick: function(){
+      state.selectedIds = allOn ? [] : visible.slice();
+      renderContent();
+    }},[text(allOn ? "Clear all" : "Select all")]));
+    bar.appendChild(el("button",{class:"btn btn-outline", type:"button", disabled: none, onclick: function(){
+      openCombinedNotes(selectedEntries(), "Combined notes", state.sectionFilter);
+    }},[text("Get notes")]));
+    bar.appendChild(el("button",{class:"btn btn-outline", type:"button", disabled: none, onclick: openSectionPicker},[text("Add to section")]));
+    if (state.sectionFilter){
+      bar.appendChild(el("button",{class:"btn btn-outline", type:"button", disabled: none, onclick: function(){
+        applyToSelected({ sectionIds: firebase.firestore.FieldValue.arrayRemove(state.sectionFilter) });
+      }},[text("Remove from section")]));
+    }
+    bar.appendChild(el("button",{class:"btn btn-danger", type:"button", style:"padding:7px 14px; font-size:13px;", disabled: none, onclick: deleteSelected},[text("Delete")]));
+  }
+  function finishSelecting(){
+    state.bulkBusy = false;
+    state.selecting = false;
+    state.selectedIds = [];
+    renderContent();
+  }
+  function applyToSelected(patch){
+    var courseId = state.currentCourseId;
+    var ids = state.selectedIds.slice();
+    state.bulkBusy = true;
+    drawSelectionBar();
+    var failed = 0;
+    inPool(ids, 6, function(id){
+      return db.doc("courses/" + courseId + "/entries/" + id).update(patch).catch(function(){ failed++; });
+    }).then(function(){
+      finishSelecting();
+      if (failed) alert(failed + " of " + ids.length + " couldn't be updated. Try those again.");
+    });
+  }
+  function deleteSelected(){
+    var entries = selectedEntries();
+    var count = entries.length;
+    if (!count) return;
+    var label = count === 1 ? '"' + (entries[0].title || "this entry") + '"' : count + " lectures and notes";
+    if (!confirm("Delete " + label + ", including recordings, slides and notes? This can't be undone.")) return;
+    var courseId = state.currentCourseId;
+    state.bulkBusy = true;
+    drawSelectionBar();
+    var failed = 0;
+    inPool(entries, 3, function(e){
+      return removeEntryCompletely(courseId, e).catch(function(){ failed++; });
+    }).then(function(){
+      finishSelecting();
+      if (failed) alert(failed + " of " + count + " couldn't be deleted. Try those again.");
+    });
+  }
+  function renderSectionBar(content, sections){
+    if (!state.entries.length) return;
+    var bar = el("div",{class:"section-bar"});
+    function chip(label, id){
+      return el("button",{class:"section-chip" + (state.sectionFilter === id ? " on" : ""), type:"button", onclick: function(){
+        state.sectionFilter = id;
+        renderContent();
+      }},[text(label)]);
+    }
+    if (!sections.length) return;
+    bar.appendChild(chip("All", null));
+    sections.forEach(function(s){
+      var n = state.entries.filter(function(e){ return (e.sectionIds || []).indexOf(s.id) > -1; }).length;
+      bar.appendChild(chip(s.name + " (" + n + ")", s.id));
+    });
+    content.appendChild(bar);
+    var active = sections.find(function(s){ return s.id === state.sectionFilter; });
+    if (!active || state.selecting) return;
+    var members = state.entries.filter(function(e){ return (e.sectionIds || []).indexOf(active.id) > -1; });
+    content.appendChild(el("div",{class:"section-tools"},[
+      el("button",{class:"btn btn-primary", type:"button", disabled: !members.length, onclick: function(){
+        openCombinedNotes(members, "Notes — " + active.name, active.id);
+      }},[text("Get notes from this section")]),
+      el("button",{class:"btn btn-ghost", type:"button", onclick: function(){
+        var name = prompt("Rename this section:", active.name);
+        if (name === null || !name.trim()) return;
+        updateCourseData({ sections: sections.map(function(s){ return s.id === active.id ? { id: s.id, name: name.trim() } : s; }) }).catch(function(err){ alert("Couldn't rename it: " + err.message); });
+      }},[text("Rename")]),
+      el("button",{class:"btn btn-ghost", type:"button", onclick: function(){
+        if (!confirm('Delete the section "' + active.name + '"? Its lectures and notes are kept.')) return;
+        var courseId = state.currentCourseId;
+        state.sectionFilter = null;
+        inPool(members, 6, function(e){
+          return db.doc("courses/" + courseId + "/entries/" + e.id).update({ sectionIds: firebase.firestore.FieldValue.arrayRemove(active.id) }).catch(function(){});
+        }).then(function(){
+          return updateCourseData({ sections: sections.filter(function(s){ return s.id !== active.id; }) });
+        }).catch(function(err){ alert("Couldn't delete it: " + err.message); });
+        renderContent();
+      }},[text("Delete section")])
+    ]));
+  }
+  function openSectionPicker(){
+    var root = document.getElementById("modalRoot");
+    var sections = currentSections();
+    var nameInput = el("input",{placeholder:"e.g. Midterm 1"});
+    function addTo(id){
+      closeModal();
+      applyToSelected({ sectionIds: firebase.firestore.FieldValue.arrayUnion(id) });
+    }
+    function createAndAdd(){
+      var name = nameInput.value.trim();
+      if (!name){ nameInput.focus(); return; }
+      var existing = sections.find(function(s){ return s.name.toLowerCase() === name.toLowerCase(); });
+      if (existing){ addTo(existing.id); return; }
+      var section = { id: "s" + Date.now().toString(36), name: name };
+      updateCourseData({ sections: firebase.firestore.FieldValue.arrayUnion(section) }).then(function(){ addTo(section.id); }).catch(function(err){
+        alert("Couldn't create the section: " + err.message);
+      });
+    }
+    nameInput.addEventListener("keydown", function(ev){ if (ev.key === "Enter") createAndAdd(); });
+    var count = state.selectedIds.length;
+    var pick = el("div",{class:"section-pick"});
+    sections.forEach(function(s){
+      pick.appendChild(el("button",{class:"btn btn-outline", type:"button", onclick: function(){ addTo(s.id); }},[text(s.name)]));
+    });
+    var modal = el("div",{class:"modal"},[
+      el("h3",{},[text("Add " + count + (count === 1 ? " item" : " items") + " to a section")]),
+      sections.length ? pick : null,
+      el("div",{class:"field"},[el("label",{},[text("New section")]), nameInput]),
+      el("div",{class:"modal-actions"},[
+        el("button",{class:"btn btn-outline", type:"button", onclick: closeModal},[text("Cancel")]),
+        el("button",{class:"btn btn-primary", type:"button", onclick: createAndAdd},[text("Create and add")])
+      ])
+    ]);
+    root.innerHTML = "";
+    root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
+    setTimeout(function(){ nameInput.focus(); }, 0);
+  }
+
+  var COMBINE_LIMIT = 100000; // how much the Worker reads for a summary
+  function mergedNotesText(entries){
+    return entries.map(function(e){
+      var body = (e.notesText || "").trim();
+      // Each lecture becomes a heading, so its own headings move down a level.
+      body = body ? body.replace(/^(#{1,2})\s/gm, "### ") : "No notes for this one yet.";
+      return "## " + (e.title || "Untitled") + "\n\n" + body;
+    }).join("\n\n");
+  }
+  // Uses full transcripts when they fit. When they don't, a lecture's shorter
+  // notes stand in for its transcript, so every lecture is still covered.
+  function combinedMaterial(entries){
+    function build(preferNotes){
+      return entries.map(function(e){
+        var text = preferNotes ? (e.notesText || e.transcript || "") : [e.transcript, e.notesText].filter(Boolean).join("\n\n");
+        return "=== " + (e.title || "Untitled") + " ===\n" + text;
+      }).join("\n\n");
+    }
+    var full = build(false);
+    return full.length <= COMBINE_LIMIT ? { text: full, partial: false } : { text: build(true), partial: true };
+  }
+  function openCombinedNotes(entries, title, sectionId){
+    var root = document.getElementById("modalRoot");
+    var course = currentCourse();
+    var ordered = entries.slice().sort(function(a, b){ return String(a.date || "").localeCompare(String(b.date || "")); });
+    var modal = el("div",{class:"modal", style:"max-width:640px;"});
+    var count = ordered.length + (ordered.length === 1 ? " item" : " items");
+    function showResult(notes, note){
+      modal.innerHTML = "";
+      modal.appendChild(el("h3",{},[text(title)]));
+      if (note) modal.appendChild(el("div",{class:"rec-note", style:"margin-bottom:10px;"},[text(note)]));
+      var body = el("div",{class:"notes-preview guide-body"});
+      lib.renderNotes(body, notes);
+      modal.appendChild(body);
+      modal.appendChild(el("div",{class:"modal-actions", style:"justify-content:space-between; flex-wrap:wrap;"},[
+        el("button",{class:"btn btn-outline", type:"button", onclick: showChoice},[text("Back")]),
+        el("div",{style:"display:flex; gap:8px; flex-wrap:wrap;"},[
+          el("button",{class:"btn btn-outline", type:"button", onclick: function(){
+            downloadEntryPdf({ title: title, date: nowIso(), notesText: notes }, course ? course.name : "");
+          }},[text("Export as PDF")]),
+          el("button",{class:"btn btn-primary", type:"button", onclick: function(){
+            closeModal();
+            state.selecting = false;
+            state.selectedIds = [];
+            addNoteEntry(title, notes, sectionId);
+          }},[text("Save to course")])
+        ])
+      ]));
+    }
+    function runAi(){
+      var material = combinedMaterial(ordered);
+      modal.innerHTML = "";
+      modal.appendChild(el("h3",{},[text(title)]));
+      modal.appendChild(el("div",{class:"rec-note"},[text("Writing notes across " + count + "…")]));
+      generateSummaryNotes(material.text, slideUrlsFor(ordered), courseTerms(state.currentCourseId)).then(function(notes){
+        if (!notes.trim()) throw new Error("The AI didn't return notes.");
+        var cutOff = material.text.length > COMBINE_LIMIT;
+        showResult(notes, cutOff
+          ? "That's a lot of material, so these notes may leave out the last lectures. Select fewer for better coverage."
+          : (material.partial ? "To fit everything, your existing notes were used in place of full transcripts where available." : ""));
+      }).catch(function(err){
+        modal.innerHTML = "";
+        modal.appendChild(el("h3",{},[text(title)]));
+        modal.appendChild(el("div",{class:"rec-warn"},[text("Couldn't write the notes (" + (err && err.message || err) + ").")]));
+        modal.appendChild(el("div",{class:"modal-actions"},[el("button",{class:"btn btn-outline", type:"button", onclick: showChoice},[text("Back")])]));
+      });
+    }
+    function showChoice(){
+      modal.innerHTML = "";
+      modal.appendChild(el("h3",{},[text(title)]));
+      modal.appendChild(el("div",{class:"rec-note", style:"margin-bottom:12px;"},[text("From " + count + ", oldest first.")]));
+      var withText = ordered.filter(function(e){ return (e.transcript || "").trim() || (e.notesText || "").trim(); }).length;
+      var withNotes = ordered.filter(function(e){ return (e.notesText || "").trim(); }).length;
+      var choices = el("div",{class:"notes-choice"},[
+        el("button",{class:"rec-choice-btn", type:"button", disabled: !withNotes, onclick: function(){ showResult(mergedNotesText(ordered), ""); }},[
+          el("div",{class:"rec-choice-title"},[text("Put my notes together")]),
+          el("div",{class:"rec-choice-desc"},[text("All the existing notes in one document, unchanged. " + withNotes + " of " + ordered.length + " have notes.")])
+        ])
+      ]);
+      if (AI_ENABLED){
+        choices.appendChild(el("button",{class:"rec-choice-btn", type:"button", disabled: !withText, onclick: runAi},[
+          el("div",{class:"rec-choice-title"},[text("Write new notes with AI")]),
+          el("div",{class:"rec-choice-desc"},[text("One organized set of notes covering all of it.")])
+        ]));
+      }
+      modal.appendChild(choices);
+      modal.appendChild(el("div",{class:"modal-actions"},[el("button",{class:"btn btn-outline", type:"button", onclick: closeModal},[text("Close")])]));
+    }
+    showChoice();
+    root.innerHTML = "";
+    root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
   }
 
   function renderHomeDashboard(content){
