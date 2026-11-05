@@ -681,7 +681,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: "searchterms", question: question, history: history || [] })
     }).then(function(res){ return res.ok ? res.json() : { terms: [] }; }).then(function(data){ return data.terms || []; });
-    var timeout = new Promise(function(resolve){ setTimeout(function(){ resolve([]); }, 2500); });
+    var timeout = new Promise(function(resolve){ setTimeout(function(){ resolve([]); }, 4000); });
     return Promise.race([request, timeout]).catch(function(){ return []; });
   }
   function generateStudyItems(genType, count, ctx){
