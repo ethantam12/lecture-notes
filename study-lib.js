@@ -96,6 +96,45 @@
     scored.sort(function(a, b){ return b.score - a.score; });
     return scored.map(function(s){ return s.passage; });
   }
+  function passageKey(p){ return p.entryId + "|" + p.text; }
+  // Combines the word-match order with the by-meaning order. A passage near the
+  // top of either list ends up near the top overall.
+  function blendRankings(byWords, byMeaning, all){
+    var score = {}, lookup = {};
+    all.forEach(function(p){ lookup[passageKey(p)] = p; });
+    function add(list){
+      list.forEach(function(p, i){
+        var key = passageKey(p);
+        if (lookup[key]) score[key] = (score[key] || 0) + 1 / (60 + i);
+      });
+    }
+    add(byWords);
+    add(byMeaning);
+    return Object.keys(score).sort(function(a, b){ return score[b] - score[a]; }).map(function(key){ return lookup[key]; });
+  }
+  // Vectors are stored as one signed byte per number, which keeps a lecture's
+  // search data small.
+  function encodeVector(values){
+    var max = 0;
+    values.forEach(function(v){ max = Math.max(max, Math.abs(v)); });
+    var bytes = values.map(function(v){ return String.fromCharCode(Math.round((max ? v / max : 0) * 127) + 128); }).join("");
+    return btoa(bytes);
+  }
+  function decodeVector(encoded){
+    var raw = atob(encoded), out = new Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i) - 128;
+    return out;
+  }
+  function cosine(a, b){
+    var dot = 0, na = 0, nb = 0;
+    for (var i = 0; i < a.length && i < b.length; i++){ dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return na && nb ? dot / Math.sqrt(na * nb) : 0;
+  }
+  function textFingerprint(text){
+    var hash = 0;
+    for (var i = 0; i < text.length; i++) hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+    return text.length + "-" + hash;
+  }
   // Builds what the AI reads for a question: a short overview of every entry
   // (so "what have we covered?" works) plus the passages that best match it.
   // The best matches go last: if a Worker trims the text to a smaller limit, it
@@ -123,6 +162,7 @@
     var passagesByEntry = usable.map(function(e){ return entryPassages(e); });
     var all = [].concat.apply([], passagesByEntry);
     var ranked = rankPassages(question + " " + (opts.terms || []).join(" "), all);
+    if (opts.meaning && opts.meaning.length) ranked = blendRankings(ranked, opts.meaning, all);
     var bestEntryIds = [];
     ranked.slice(0, 8).forEach(function(p){ if (bestEntryIds.indexOf(p.entryId) === -1) bestEntryIds.push(p.entryId); });
     // A broad question may match nothing, so fill any leftover room evenly
@@ -316,6 +356,7 @@
     tokenize: tokenize, fmtStamp: fmtStamp, parseStamp: parseStamp, splitText: splitText,
     entryPassages: entryPassages, rankPassages: rankPassages, buildAiContext: buildAiContext,
     splitCitations: splitCitations, timestampedTranscript: timestampedTranscript,
+    encodeVector: encodeVector, decodeVector: decodeVector, cosine: cosine, textFingerprint: textFingerprint,
     scheduleCard: scheduleCard, dueCards: dueCards, mergeCards: mergeCards,
     recordTopicResult: recordTopicResult, weakTopics: weakTopics,
     parseNotes: parseNotes, spansText: spansText, renderNotes: renderNotes,

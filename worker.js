@@ -33,6 +33,15 @@
 //   "searchterms" — suggests keywords and synonyms, which the site uses to
 //                find the lecture passages relevant to a question.
 //   "ask" and "chat" stream their answer as plain text when body.stream is set.
+//   "title"      — suggests a short title for a lecture.
+//   "embed"      — turns text into vectors, for searching lectures by meaning.
+//   "enqueue" and "jobkick" — start or resume a background job (see below).
+//
+// Background jobs let a lecture's AI steps finish after its tab is closed. The
+// Worker can't write to Firebase, so each job keeps its results in R2 at
+// jobs/<courseId>/<entryId>.json and the site collects them when it's next open.
+// A job starts straight away but only gets 30 seconds after the response, so a
+// Cron Trigger (set to every minute on this Worker) finishes whatever is left.
 //
 // 2. File storage (HTTP GET/PUT/DELETE) — recordings, slides, and notes PDFs
 //    live in a bound R2 bucket (binding name RECORDINGS_BUCKET) instead of
@@ -64,6 +73,15 @@ const ANSWER_RULES =
   "The transcripts are auto-generated and can contain misheard words, so when a term looks wrong, use what it most likely means and say so. " +
   "When asked to explain something, use plain language and one concrete example. " +
   "Format with simple markdown: short paragraphs, - for lists and **bold** for key terms. No headings unless the answer is long.";
+
+const EMBED_MODEL = "gemini-embedding-001";
+const EMBED_DIMENSIONS = 256;
+
+function termsNote(terms) {
+  return terms
+    ? "This course uses these names and terms. Spell them exactly like this when they come up, but never add them if they weren't said: " + terms + ". "
+    : "";
+}
 
 function corsHeaders() {
   return {
@@ -161,8 +179,21 @@ async function fetchSlideParts(slideUrls) {
   return results.filter(Boolean);
 }
 
-function httpError(message, status, overloaded) {
-  return Object.assign(new Error(message), { status: status, overloaded: !!overloaded });
+function httpError(message, status, overloaded, kind) {
+  return Object.assign(new Error(message), { status: status, overloaded: !!overloaded, kind: kind || "" });
+}
+
+function kindOfFailure(status, message) {
+  if (status === 429 || /quota|rate limit/i.test(message)) return "quota";
+  if (status === 503 || /overload|unavailable|high demand/i.test(message)) return "busy";
+  return "";
+}
+
+// What the student sees once every model has been tried.
+function friendlyError(e) {
+  if (e && e.kind === "quota") return httpError("The AI has reached its usage limit for now. Try again in a few minutes, or tomorrow if it's the daily limit.", 429, true, "quota");
+  if (e && e.kind === "busy") return httpError("The AI is very busy right now. Try again in a moment.", 503, true, "busy");
+  return e;
 }
 
 // Gemini accepts audio two ways: embedded directly in the request as base64
@@ -305,7 +336,7 @@ async function callGeminiOnce(env, model, requestBody) {
   if (!res.ok) {
     const msg = (data && data.error && data.error.message) || "Gemini request failed";
     const overloaded = shouldTryNextModel(res.status, msg);
-    throw httpError(msg, 502, overloaded);
+    throw httpError(msg, 502, overloaded, kindOfFailure(res.status, msg));
   }
   const candidate = data.candidates && data.candidates[0];
   return (candidate && candidate.content && candidate.content.parts && candidate.content.parts.map(p => p.text || "").join("")) || "";
@@ -328,7 +359,7 @@ async function callGemini(env, requestBody, models) {
       if (!e.overloaded) throw e;
     }
   }
-  throw lastErr;
+  throw friendlyError(lastErr);
 }
 
 // Sends the answer to the browser as it's written. Falling back to another
@@ -344,10 +375,10 @@ async function streamGemini(env, requestBody, models) {
     if (res.ok) { upstream = res; break; }
     const data = await res.json().catch(() => ({}));
     const msg = (data && data.error && data.error.message) || "Gemini request failed";
-    lastErr = httpError(msg, 502, shouldTryNextModel(res.status, msg));
+    lastErr = httpError(msg, 502, shouldTryNextModel(res.status, msg), kindOfFailure(res.status, msg));
     if (!lastErr.overloaded) throw lastErr;
   }
-  if (!upstream) throw lastErr;
+  if (!upstream) throw friendlyError(lastErr);
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -374,6 +405,180 @@ async function streamGemini(env, requestBody, models) {
     cancel() { return reader.cancel(); }
   });
   return new Response(body, { headers: { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" } });
+}
+
+async function summarizeText(env, transcript, slideUrls, terms) {
+  const promptText =
+    "You are an expert note-taker helping a student study. Read the lecture transcript below and write clear, " +
+    "well-organized study notes covering everything important in it. Start with a one-to-two sentence overview " +
+    "of what the lecture was about. Then cover the main topics in the order they came up, using a short topic " +
+    "label followed by a few sentences explaining it — include specific facts, definitions, dates, names, and " +
+    "examples that were actually mentioned, not vague generalities. " +
+    "If slides are attached, use them too, and include anything important they add. " + termsNote(terms) +
+    "Format with simple markdown only: ## for each topic heading, - for list items, and **bold** for key terms. " +
+    "Use no other formatting.\n\n" + buildContextText(transcript.slice(0, 100000), "");
+  const slideParts = await fetchSlideParts(slideUrls || []);
+  return callGemini(env, {
+    contents: [{ parts: [{ text: promptText }, ...slideParts] }],
+    generationConfig: { thinkingConfig: { thinkingLevel: "low" }, maxOutputTokens: 5000 }
+  });
+}
+
+async function cleanSection(env, section, terms) {
+  const promptText =
+    "Below is a raw, AI-generated verbatim transcript of a recorded lecture, stitched together from many short audio chunks. " +
+    "Rewrite it for readability WITHOUT summarizing, shortening, or omitting any actual content: remove filler words and false " +
+    "starts (um, uh, you know, restarted sentences), fix punctuation and capitalization, and reorganize it into natural " +
+    "paragraphs by topic instead of the arbitrary chunk breaks in the raw text below. Keep every fact, name, number, and " +
+    "example that was actually said — this must remain a complete, faithful record of the lecture, just easier to read. " + termsNote(terms) +
+    "Do not add commentary, headers, or anything that wasn't actually said.\n\n" + buildContextText(section, "");
+  return callGemini(env, {
+    contents: [{ parts: [{ text: promptText }] }],
+    generationConfig: { thinkingConfig: { thinkingLevel: "low" }, maxOutputTokens: 8192 }
+  });
+}
+
+async function findMoments(env, transcript) {
+  const promptText =
+    "Find the moments in this lecture transcript that a student must not miss: hints about what will be on an exam (kind \"exam\"), " +
+    "due dates and deadlines (\"deadline\"), formal definitions of key terms (\"definition\"), and course logistics announcements " +
+    "(\"announcement\"). Only list what was actually said, and return an empty list if there are none. " +
+    "Lines may start with a time marker like [12:30].\n\n" + buildContextText(transcript.slice(0, 100000), "");
+  const raw = await callGemini(env, {
+    contents: [{ parts: [{ text: promptText }] }],
+    generationConfig: {
+      thinkingConfig: { thinkingLevel: "low" },
+      maxOutputTokens: 3000,
+      responseMimeType: "application/json",
+      responseSchema: keyMomentSchema()
+    }
+  });
+  const moments = JSON.parse(raw);
+  if (!Array.isArray(moments)) throw new Error("The AI didn't return usable results.");
+  return moments;
+}
+
+async function suggestTitle(env, transcript) {
+  const raw = await callGemini(env, {
+    contents: [{ parts: [{ text:
+      "Write a short, specific title of 2 to 6 words for this lecture, naming its main topic, such as \"Enzymes and metabolism\". " +
+      "Reply with only the title, with no quotes or final period.\n\nTRANSCRIPT:\n" + transcript.slice(0, 12000) }] }],
+    generationConfig: { thinkingConfig: { thinkingLevel: "minimal" }, maxOutputTokens: 60 }
+  });
+  return raw.replace(/^["'\s]+|["'.\s]+$/g, "").slice(0, 80);
+}
+
+function splitSections(text, size) {
+  const out = [];
+  let rest = text;
+  while (rest.length > size) {
+    let cut = rest.lastIndexOf(". ", size);
+    if (cut < size / 2) cut = size - 2;
+    out.push(rest.slice(0, cut + 2));
+    rest = rest.slice(cut + 2);
+  }
+  if (rest.trim()) out.push(rest);
+  return out;
+}
+
+const JOB_STEPS = ["summary", "title", "moments", "cleanup"];
+const JOB_MAX_ATTEMPTS = 4; // keeps a step that always fails from using up the AI quota
+const JOB_LEASE_MS = 90000;
+const JOB_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+function jobKey(courseId, entryId) { return "jobs/" + courseId + "/" + entryId + ".json"; }
+
+function saveJob(env, key, job) {
+  return env.RECORDINGS_BUCKET.put(key, JSON.stringify(job), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { done: job.done ? "1" : "0" }
+  });
+}
+
+async function runJobStep(env, key, job, step) {
+  const attempt = job.attempts[step];
+  if (step === "summary") {
+    // On the later attempts, leave the slides out in case they're what's failing.
+    job.result.notes = await summarizeText(env, job.transcript, attempt <= 2 ? job.slideUrls : [], job.terms);
+  } else if (step === "title") {
+    job.result.title = await suggestTitle(env, job.transcript);
+  } else if (step === "moments") {
+    job.result.moments = await findMoments(env, job.timestamped || job.transcript);
+  } else {
+    const sections = splitSections(job.transcript, 20000);
+    job.result.cleanSections = job.result.cleanSections || [];
+    for (let i = job.result.cleanSections.length; i < sections.length; i++) {
+      job.result.cleanSections.push((await cleanSection(env, sections[i], job.terms)) || sections[i]);
+      await saveJob(env, key, job);
+    }
+  }
+}
+
+async function runJob(env, key, force) {
+  const object = await env.RECORDINGS_BUCKET.get(key);
+  if (!object) return;
+  const job = await object.json();
+  if (job.done || (!force && job.leaseUntil > Date.now())) return;
+  for (const step of JOB_STEPS) {
+    if (job.steps[step]) continue;
+    // Counted before running, so a run that gets cut off still counts.
+    job.attempts[step] = (job.attempts[step] || 0) + 1;
+    if (job.attempts[step] > JOB_MAX_ATTEMPTS) { job.steps[step] = "failed"; continue; }
+    job.leaseUntil = Date.now() + JOB_LEASE_MS;
+    await saveJob(env, key, job);
+    try {
+      await runJobStep(env, key, job, step);
+      job.steps[step] = "done";
+      await saveJob(env, key, job);
+    } catch (e) {
+      job.lastError = String((e && e.message) || e).slice(0, 300);
+      // Waits 2, 4, 8, then 16 minutes, so a busy or rate-limited AI has time to recover.
+      job.leaseUntil = Date.now() + 60000 * Math.pow(2, job.attempts[step]);
+      await saveJob(env, key, job);
+      return;
+    }
+  }
+  job.done = true;
+  job.leaseUntil = 0;
+  await saveJob(env, key, job);
+}
+
+async function runPendingJobs(env) {
+  const startedAt = Date.now();
+  const listed = await env.RECORDINGS_BUCKET.list({ prefix: "jobs/", limit: 100, include: ["customMetadata"] });
+  for (const item of listed.objects) {
+    if (Date.now() - new Date(item.uploaded).getTime() > JOB_MAX_AGE_MS) {
+      await env.RECORDINGS_BUCKET.delete(item.key);
+      continue;
+    }
+    if (item.customMetadata && item.customMetadata.done === "1") continue;
+    if (Date.now() - startedAt > 12 * 60 * 1000) return;
+    await runJob(env, item.key, false);
+  }
+}
+
+async function embedTexts(env, texts, kind) {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:batchEmbedContents?key=${env.GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requests: texts.map((text) => ({
+          model: "models/" + EMBED_MODEL,
+          content: { parts: [{ text: text }] },
+          taskType: kind === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT",
+          outputDimensionality: EMBED_DIMENSIONS
+        }))
+      })
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data && data.error && data.error.message) || "Embedding request failed";
+    throw friendlyError(httpError(msg, 502, false, kindOfFailure(res.status, msg)));
+  }
+  return (data.embeddings || []).map((e) => e.values);
 }
 
 function flashcardSchema() {
@@ -423,7 +628,11 @@ function keyMomentSchema() {
 }
 
 export default {
-  async fetch(request, env) {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runPendingJobs(env));
+  },
+
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders() });
     }
@@ -466,8 +675,36 @@ export default {
       : (fullTranscript.length > ANSWER_CONTEXT_LIMIT ? fullTranscript.slice(-ANSWER_CONTEXT_LIMIT) : fullTranscript);
     const notes = String(body.notes || "").slice(0, 12000);
     const slideUrls = Array.isArray(body.slideUrls) ? body.slideUrls.slice(0, 8) : [];
+    const terms = String(body.terms || "").slice(0, 1000);
 
     try {
+      if (mode === "enqueue" || mode === "jobkick") {
+        const courseId = String(body.courseId || ""), entryId = String(body.entryId || "");
+        if (!/^[\w-]{1,128}$/.test(courseId) || !/^[\w-]{1,128}$/.test(entryId)) return jsonResponse({ error: "Invalid job" }, 400);
+        if (!env.RECORDINGS_BUCKET) return jsonResponse({ error: "Storage isn't set up on this Worker yet." }, 500);
+        const key = jobKey(courseId, entryId);
+        if (mode === "enqueue") {
+          if (!fullTranscript.trim()) return jsonResponse({ error: "No transcript to process" }, 400);
+          await saveJob(env, key, {
+            courseId, entryId, transcript: fullTranscript, timestamped: String(body.timestamped || ""), slideUrls, terms,
+            steps: {}, attempts: {}, result: {}, done: false, leaseUntil: 0, createdAt: Date.now()
+          });
+        }
+        ctx.waitUntil(runJob(env, key, mode === "enqueue").catch(() => {}));
+        return jsonResponse({ queued: true });
+      }
+
+      if (mode === "embed") {
+        const texts = Array.isArray(body.texts) ? body.texts.slice(0, 100).map((t) => String(t).slice(0, 4000)) : [];
+        if (!texts.length) return jsonResponse({ error: "Nothing to embed" }, 400);
+        return jsonResponse({ vectors: await embedTexts(env, texts, body.kind) });
+      }
+
+      if (mode === "title") {
+        if (!fullTranscript.trim()) return jsonResponse({ error: "No transcript" }, 400);
+        return jsonResponse({ title: await suggestTitle(env, fullTranscript) });
+      }
+
       if (mode === "chat") {
         const question = String(body.question || "").slice(0, 4000);
         if (!question) return jsonResponse({ error: "Missing question" }, 400);
@@ -552,7 +789,7 @@ export default {
           "It may be a short excerpt from a longer recording — transcribe only what is actually heard, " +
           "with no introduction, commentary, or note about it being an excerpt. " +
           "Capture everything that is said — do not summarize, paraphrase, or skip parts. " +
-          "If a portion is inaudible or unclear, write [inaudible] rather than guessing at it.";
+          "If a portion is inaudible or unclear, write [inaudible] rather than guessing at it. " + termsNote(terms);
         const newTranscript = await callGemini(env, {
           contents: [{ parts: [{ text: promptText }, audioPart] }],
           generationConfig: { thinkingConfig: { thinkingLevel: "minimal" }, maxOutputTokens: 8192 }
@@ -595,21 +832,7 @@ export default {
         // in a first draft of the student's notes — no button press needed.
         if (!transcript && !notes) return jsonResponse({ error: "No transcript or notes to summarize" }, 400);
 
-        const promptText =
-          "You are an expert note-taker helping a student study. Read the lecture transcript below and write clear, " +
-          "well-organized study notes covering everything important in it. Start with a one-to-two sentence overview " +
-          "of what the lecture was about. Then cover the main topics in the order they came up, using a short topic " +
-          "label followed by a few sentences explaining it — include specific facts, definitions, dates, names, and " +
-          "examples that were actually mentioned, not vague generalities. " +
-          "If slides are attached, use them too, and include anything important they add. " +
-          "Format with simple markdown only: ## for each topic heading, - for list items, and **bold** for key terms. " +
-          "Use no other formatting.\n\n" + buildContextText(transcript, notes);
-        const slideParts = await fetchSlideParts(slideUrls);
-
-        const notesOut = await callGemini(env, {
-          contents: [{ parts: [{ text: promptText }, ...slideParts] }],
-          generationConfig: { thinkingConfig: { thinkingLevel: "low" }, maxOutputTokens: 5000 }
-        });
+        const notesOut = await summarizeText(env, transcript + (notes ? "\n\nSTUDENT'S NOTES:\n" + notes : ""), slideUrls, terms);
         if (!notesOut) return jsonResponse({ error: "The AI didn't return notes. Try again." }, 502);
         return jsonResponse({ notes: notesOut });
       }
@@ -635,52 +858,19 @@ export default {
 
       if (mode === "keymoments") {
         if (!transcript) return jsonResponse({ error: "No transcript to read" }, 400);
-        const promptText =
-          "Find the moments in this lecture transcript that a student must not miss: hints about what will be on an exam (kind \"exam\"), " +
-          "due dates and deadlines (\"deadline\"), formal definitions of key terms (\"definition\"), and course logistics announcements " +
-          "(\"announcement\"). Only list what was actually said, and return an empty list if there are none. " +
-          "Lines may start with a time marker like [12:30].\n\n" + buildContextText(transcript, "");
-        const raw = await callGemini(env, {
-          contents: [{ parts: [{ text: promptText }] }],
-          generationConfig: {
-            thinkingConfig: { thinkingLevel: "low" },
-            maxOutputTokens: 3000,
-            responseMimeType: "application/json",
-            responseSchema: keyMomentSchema()
-          }
-        });
-        let moments;
-        try { moments = JSON.parse(raw); } catch (e) { moments = null; }
-        if (!Array.isArray(moments)) return jsonResponse({ error: "The AI didn't return usable results. Try again." }, 502);
-        return jsonResponse({ moments: moments });
+        return jsonResponse({ moments: await findMoments(env, transcript) });
       }
 
       if (mode === "cleanup") {
-        // Rewrites the raw, chunk-stitched transcript for readability —
-        // strips filler words/false starts, fixes punctuation, and turns the
-        // arbitrary ~30-second chunk breaks into natural paragraphs — while
-        // keeping every fact, name, and example. This is a near-verbatim
-        // rewrite (unlike "summarize", its output is roughly as long as its
-        // input), so it's capped well under this model's output-length
-        // ceiling to avoid coming back cut off partway through. Long
-        // recordings just skip this step — the raw transcript (already
-        // AI-transcribed per chunk) is still there either way.
+        // A near-verbatim rewrite, so its output is about as long as its input.
+        // This is capped below the model's output limit; the site sends long
+        // transcripts in sections.
         const CLEANUP_MAX_CHARS = 35000;
         if (!fullTranscript.trim()) return jsonResponse({ error: "No transcript to clean up" }, 400);
         if (fullTranscript.length > CLEANUP_MAX_CHARS) {
-          return jsonResponse({ skipped: true, reason: "This recording is long enough that an automatic clean-up pass isn't available yet — the original transcript is unaffected." });
+          return jsonResponse({ skipped: true, reason: "This transcript section is too long to clean up in one pass." });
         }
-        const promptText =
-          "Below is a raw, AI-generated verbatim transcript of a recorded lecture, stitched together from many short audio chunks. " +
-          "Rewrite it for readability WITHOUT summarizing, shortening, or omitting any actual content: remove filler words and false " +
-          "starts (um, uh, you know, restarted sentences), fix punctuation and capitalization, and reorganize it into natural " +
-          "paragraphs by topic instead of the arbitrary chunk breaks in the raw text below. Keep every fact, name, number, and " +
-          "example that was actually said — this must remain a complete, faithful record of the lecture, just easier to read. " +
-          "Do not add commentary, headers, or anything that wasn't actually said.\n\n" + buildContextText(fullTranscript, "");
-        const cleaned = await callGemini(env, {
-          contents: [{ parts: [{ text: promptText }] }],
-          generationConfig: { thinkingConfig: { thinkingLevel: "low" }, maxOutputTokens: 8192 }
-        });
+        const cleaned = await cleanSection(env, fullTranscript, terms);
         if (!cleaned) return jsonResponse({ error: "The AI didn't return a cleaned transcript. Try again." }, 502);
         return jsonResponse({ cleanTranscript: cleaned });
       }

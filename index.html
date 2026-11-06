@@ -448,6 +448,27 @@
   .sidebar{ position:sticky; top:0; height:100vh; overflow-y:auto; }
   .rec-panel{ box-shadow:none; }
   @media (max-width: 780px){ .sidebar{ position:static; height:auto; overflow:visible; } }
+
+  .save-tracker.cloud{ background:var(--accent-soft); }
+  .stale-notice{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:var(--warn-soft); color:var(--warn); border-radius:8px; padding:9px 12px; font-size:13px; margin-bottom:14px; }
+  .stale-notice span{ flex:1; min-width:180px; }
+
+  /* Sections and selecting */
+  .content{ overflow:visible; } /* lets the selection bar stay in view while scrolling */
+  .section-bar{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:10px; }
+  .section-chip{ background:var(--surface); border:1px solid var(--border); border-radius:999px; padding:4px 11px; font-size:12.5px; font-weight:500; color:var(--muted); cursor:pointer; }
+  .section-chip:hover{ color:var(--ink); border-color:var(--faint); }
+  .section-chip.on{ background:var(--accent-soft); border-color:transparent; color:var(--ink); }
+  .section-tools{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:10px; }
+  .list-toolbar{ justify-content:space-between; gap:8px; }
+  .entry-card.selected{ background:var(--accent-soft); }
+  .entry-check{ width:18px; height:18px; flex:none; accent-color:var(--accent); cursor:pointer; }
+  .entry-tag{ color:var(--accent); font-weight:500; }
+  .selection-bar{ position:sticky; bottom:12px; z-index:9; display:flex; flex-wrap:wrap; align-items:center; gap:8px; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:10px 12px; margin-top:14px; box-shadow:0 6px 20px rgba(40,30,10,.14); }
+  .selection-count{ font-weight:600; font-size:13.5px; margin-right:auto; }
+  .section-pick{ display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }
+  .section-pick button{ text-align:left; justify-content:flex-start; }
+  .notes-choice{ display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:10px; margin-bottom:14px; }
 </style>
 </head>
 <body>
@@ -705,11 +726,11 @@
       });
     });
   }
-  function generateSummaryNotes(transcript, slideUrls){
+  function generateSummaryNotes(transcript, slideUrls, terms){
     return fetch(window.aiConfig.workerUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "summarize", transcript: transcript || "", slideUrls: slideUrls || [] })
+      body: JSON.stringify({ mode: "summarize", transcript: transcript || "", slideUrls: slideUrls || [], terms: terms || "" })
     }).then(function(res){
       return res.json().then(function(data){
         if (!res.ok) throw new Error(data && data.error || "Request failed");
@@ -747,7 +768,7 @@
   // words, punctuation, natural paragraphs) without summarizing or dropping
   // content. Long transcripts go through in sections, so a full-length
   // lecture gets cleaned up too. Returns null if the Worker declines.
-  function generateCleanTranscript(transcript){
+  function generateCleanTranscript(transcript, terms){
     var sections = lib.splitText(transcript, 20000), cleaned = [];
     return sections.reduce(function(chain, section){
       return chain.then(function(stillGoing){
@@ -755,7 +776,7 @@
         return fetch(window.aiConfig.workerUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode: "cleanup", transcript: section })
+          body: JSON.stringify({ mode: "cleanup", transcript: section, terms: terms || "" })
         }).then(function(res){
           return res.json().then(function(data){
             if (!res.ok) throw new Error(data && data.error || "Request failed");
@@ -768,7 +789,7 @@
     }, Promise.resolve(true)).then(function(finished){ return finished ? cleaned.join("\n\n") : null; });
   }
   function runAutoCleanup(courseId, entryId, transcript){
-    return generateCleanTranscript(transcript).then(function(cleaned){
+    return generateCleanTranscript(transcript, courseTerms(courseId)).then(function(cleaned){
       if (!cleaned) return;
       updateEntryIn(courseId, entryId, { cleanTranscript: cleaned });
       patchLocalEntry(entryId, { cleanTranscript: cleaned });
@@ -777,6 +798,27 @@
         if (slot){ slot.innerHTML = ""; slot.appendChild(renderCleanTranscriptPanel(cleaned)); }
       }
     }).catch(function(){ /* non-critical — the raw transcript is still there */ });
+  }
+  function applyAiTitle(courseId, entryId, currentTitle, title){
+    if (!title || !isDefaultTitle(currentTitle)) return Promise.resolve();
+    return updateEntryIn(courseId, entryId, { title: title }).then(function(){
+      patchLocalEntry(entryId, { title: title });
+      if (state.view === "detail" && state.currentEntryId === entryId){
+        var input = document.querySelector(".detail-title");
+        if (input && input.value === currentTitle) input.value = title;
+      }
+      if (state.view === "list" && state.currentCourseId === courseId) renderContent();
+    });
+  }
+  function runAutoTitle(courseId, entryId, currentTitle, transcript){
+    if (!isDefaultTitle(currentTitle)) return Promise.resolve(true);
+    return fetch(window.aiConfig.workerUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "title", transcript: transcript })
+    }).then(function(res){ return res.ok ? res.json() : {}; }).then(function(data){
+      return applyAiTitle(courseId, entryId, currentTitle, data.title);
+    }).catch(function(){ /* the date-based title is fine */ });
   }
   function runAutoKeyMoments(courseId, entryId, entryLike){
     return findKeyMoments(entryLike).then(function(moments){
@@ -809,12 +851,12 @@
     });
   }
   var SECTION_SEC = 300, SECTION_OVERLAP_SEC = 2;
-  function transcribeSection(section, contextTail){
+  function transcribeSection(section, contextTail, terms){
     return blobToBase64(section.blob).then(function(b64){
       return fetch(window.aiConfig.workerUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "transcribe", audioBase64: b64, mimeType: "audio/wav", contextTail: contextTail })
+        body: JSON.stringify({ mode: "transcribe", audioBase64: b64, mimeType: "audio/wav", contextTail: contextTail, terms: terms || "" })
       });
     }).then(function(res){
       return res.json().then(function(data){
@@ -826,7 +868,7 @@
   // Transcribes a whole recording five minutes at a time, so a long lecture
   // can't run past the AI's output limit, and every section gets a timestamp.
   // A section that fails twice is marked in the text and counted in `failed`.
-  function transcribeAudioInSections(arrayBuffer, onProgress){
+  function transcribeAudioInSections(arrayBuffer, onProgress, terms){
     return lib.decodeToMono(arrayBuffer).then(function(audio){
       var sections = lib.audioSections(audio, SECTION_SEC, SECTION_OVERLAP_SEC);
       var segments = [], failed = 0, prev = "";
@@ -834,8 +876,8 @@
         return chain.then(function(){
           if (onProgress) onProgress(i + 1, sections.length);
           var tail = prev.split(/\s+/).slice(-40).join(" ");
-          return transcribeSection(section, tail).catch(function(){
-            return new Promise(function(resolve){ setTimeout(resolve, 1500); }).then(function(){ return transcribeSection(section, tail); });
+          return transcribeSection(section, tail, terms).catch(function(){
+            return new Promise(function(resolve){ setTimeout(resolve, 1500); }).then(function(){ return transcribeSection(section, tail, terms); });
           }).then(function(text){
             var trimmed = prev ? trimChunkOverlap(prev, text) : text;
             if (trimmed){ segments.push({ t: section.t, text: trimmed }); prev = trimmed; }
@@ -870,8 +912,82 @@
   }
   // What the AI gets for a question: the relevant parts of the given entries
   // plus slides from the entries that matched best.
-  function aiContextFor(question, entries, terms){
-    var ctx = lib.buildAiContext(question, entries, { terms: terms });
+  // Search by meaning. Each lecture's passages are turned into vectors once and
+  // kept in cloud storage. That happens in the background the first time a
+  // course is asked about, so later questions get the benefit.
+  var embeddings = { byEntry: {}, building: false, disabled: false };
+  var EMBED_BATCH = 50;
+  function embedCall(texts, kind){
+    return fetch(window.aiConfig.workerUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "embed", texts: texts, kind: kind })
+    }).then(function(res){ return res.ok ? res.json() : {}; }).then(function(data){
+      if (!Array.isArray(data.vectors) || data.vectors.length !== texts.length) throw new Error("No vectors returned");
+      return data.vectors;
+    });
+  }
+  function embeddingPath(courseId, entryId){ return cloudPath("embeddings/" + courseId + "/" + entryId + ".json"); }
+  function loadEntryVectors(courseId, entry){
+    var passages = lib.entryPassages(entry);
+    var fingerprint = lib.textFingerprint(passages.map(function(p){ return p.text; }).join("|"));
+    var cached = embeddings.byEntry[entry.id];
+    if (cached && cached.fingerprint === fingerprint) return Promise.resolve(cached);
+    return fetchStoredAudio(embeddingPath(courseId, entry.id), true).then(function(buf){
+      var saved = JSON.parse(new TextDecoder().decode(buf));
+      if (saved.fingerprint !== fingerprint || saved.vectors.length !== passages.length) return null;
+      var record = { fingerprint: fingerprint, passages: passages, vectors: saved.vectors.map(lib.decodeVector) };
+      embeddings.byEntry[entry.id] = record;
+      return record;
+    }).catch(function(){ return null; });
+  }
+  function buildEntryVectors(courseId, entry){
+    var passages = lib.entryPassages(entry);
+    var fingerprint = lib.textFingerprint(passages.map(function(p){ return p.text; }).join("|"));
+    var encoded = [], batches = [];
+    for (var i = 0; i < passages.length; i += EMBED_BATCH) batches.push(passages.slice(i, i + EMBED_BATCH));
+    return batches.reduce(function(chain, batch){
+      return chain.then(function(){
+        return embedCall(batch.map(function(p){ return p.text; }), "document").then(function(vectors){
+          vectors.forEach(function(v){ encoded.push(lib.encodeVector(v)); });
+        });
+      });
+    }, Promise.resolve()).then(function(){
+      embeddings.byEntry[entry.id] = { fingerprint: fingerprint, passages: passages, vectors: encoded.map(lib.decodeVector) };
+      var body = JSON.stringify({ fingerprint: fingerprint, vectors: encoded });
+      return uploadFile("embeddings/" + courseId + "/" + entry.id + ".json", new Blob([body], { type: "application/json" }), "application/json");
+    });
+  }
+  function buildMissingVectors(courseId, entries){
+    if (embeddings.building || embeddings.disabled) return;
+    embeddings.building = true;
+    entries.reduce(function(chain, entry){
+      return chain.then(function(){ return buildEntryVectors(courseId, entry); });
+    }, Promise.resolve()).catch(function(){
+      embeddings.disabled = true; // not worth retrying until the next visit
+    }).then(function(){ embeddings.building = false; });
+  }
+  function meaningMatches(question, entries){
+    var courseId = state.currentCourseId;
+    if (embeddings.disabled || entries.length < 2) return Promise.resolve([]);
+    var usable = entries.filter(function(e){ return (e.transcript || "").trim() || (e.notesText || "").trim(); });
+    return Promise.all(usable.map(function(e){ return loadEntryVectors(courseId, e); })).then(function(records){
+      var missing = usable.filter(function(e, i){ return !records[i]; });
+      if (missing.length) buildMissingVectors(courseId, missing);
+      var ready = records.filter(Boolean);
+      if (!ready.length) return [];
+      return embedCall([question], "query").then(function(vectors){
+        var scored = [];
+        ready.forEach(function(record){
+          record.passages.forEach(function(passage, i){ scored.push({ passage: passage, score: lib.cosine(vectors[0], record.vectors[i]) }); });
+        });
+        scored.sort(function(a, b){ return b.score - a.score; });
+        return scored.slice(0, 40).map(function(s){ return s.passage; });
+      });
+    }).catch(function(){ return []; });
+  }
+  function aiContextFor(question, entries, terms, meaning){
+    var ctx = lib.buildAiContext(question, entries, { terms: terms, meaning: meaning });
     var best = ctx.bestEntryIds.map(function(id){ return entries.find(function(e){ return e.id === id; }); }).filter(Boolean);
     ctx.slideUrls = slideUrlsFor(best.length ? best : entries);
     return ctx;
@@ -945,9 +1061,10 @@
       box.appendChild(bubble);
       scroll();
       var recent = prior.filter(function(m){ return m.role === "user"; }).slice(-2).map(function(m){ return m.text; }).join(" ");
-      searchTermsFor(q, prior).then(function(terms){
+      var meaningTimeout = new Promise(function(resolve){ setTimeout(function(){ resolve([]); }, 4000); });
+      Promise.all([searchTermsFor(q, prior), Promise.race([meaningMatches(q + " " + recent, entries), meaningTimeout])]).then(function(found){
         // Earlier questions go into the search so "what about the second one?" still finds the topic.
-        var ctx = aiContextFor(q + " " + recent, entries, terms);
+        var ctx = aiContextFor(q + " " + recent, entries, found[0], found[1]);
         return askAIChat(q, prior, { transcript: ctx.contextText, slideUrls: ctx.slideUrls }, function(partial){
           bubble.classList.remove("thinking");
           renderAnswer(bubble, partial, ctx.sources);
@@ -1029,6 +1146,10 @@
     unsubEntries: null,
     autoSummaryPending: {},
     autoTranscribePending: {},
+    selecting: false,
+    selectedIds: [],
+    sectionFilter: null,
+    bulkBusy: false,
     trackers: [],
     detailAudio: null,
     pendingSeek: null,
@@ -1095,6 +1216,13 @@
     var source = (entry.notesText || entry.transcript || "").slice(0, 400);
     return lib.parseNotes(source).map(function(block){ return lib.spansText(block.spans); }).join(" ").slice(0, 140);
   }
+  function courseTerms(courseId){
+    var course = state.courses.find(function(c){ return c.id === courseId; });
+    return (course && course.terms) || "";
+  }
+  // Titles the app made itself, like "BIO 201 — Oct 28". The AI only ever
+  // replaces these, never one the student wrote.
+  function isDefaultTitle(title){ return /^.+ — \S+ \d{1,2}$/.test(String(title || "")); }
   function dateTile(iso){
     var d = new Date(iso);
     var ok = !isNaN(d.getTime());
@@ -1437,6 +1565,7 @@
       state.courses = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
       renderSidebar();
       scanCloudRecordingsIfChanged();
+      scanPendingJobs();
       if (!state.currentCourseId){
         var remembered = lsGet("lecnotes.lastCourse");
         var pick = state.courses.find(function(c){ return c.id === remembered; }) || state.courses[0];
@@ -1494,6 +1623,9 @@
     state.currentEntryId = null;
     state.view = "list";
     state.searchTerm = "";
+    state.selecting = false;
+    state.selectedIds = [];
+    state.sectionFilter = null;
     state.entries = [];
     lsSet("lecnotes.lastCourse", id);
     renderSidebar(); renderHeader();
@@ -1528,12 +1660,13 @@
   // ---------------------------------------------------------------
   // Entries
   // ---------------------------------------------------------------
-  function addNoteEntry(title, bodyText){
+  function addNoteEntry(title, bodyText, sectionId){
     var courseId = state.currentCourseId;
     if (!courseId) return;
     db.collection("courses/" + courseId + "/entries").add({
       type: "note", title: title || "Untitled note", date: nowIso(),
-      notesText: bodyText || "", transcript: "", audioPath: null, slidePaths: [], createdAt: nowIso()
+      notesText: bodyText || "", transcript: "", audioPath: null, slidePaths: [], createdAt: nowIso(),
+      sectionIds: sectionId ? [sectionId] : []
     }).then(function(ref){ openEntry(ref.id); });
   }
   function addTranscriptEntry(title, transcriptText){
@@ -1574,14 +1707,19 @@
     if (!state.currentCourseId) return;
     db.doc("courses/" + state.currentCourseId + "/entries/" + id).update(patch).catch(function(){});
   }
+  // Removes an entry's stored files, then the entry itself.
+  function removeEntryCompletely(courseId, e){
+    var job = e.audioPath ? removeFile(e.audioPath).catch(function(){}) : Promise.resolve();
+    var pdfJob = e.notesPdfPath ? removeFile(e.notesPdfPath).catch(function(){}) : Promise.resolve();
+    removeFile(embeddingPath(courseId, e.id)).catch(function(){});
+    var slideJobs = (e.slidePaths || []).map(function(p){ return removeFile(p).catch(function(){}); });
+    return Promise.all([job, pdfJob].concat(slideJobs)).then(function(){ return db.doc("courses/" + courseId + "/entries/" + e.id).delete(); });
+  }
   function deleteEntry(id){
     var e = state.entries.find(function(x){ return x.id === id; });
     if (!e) return;
     if (!confirm('Delete "' + (e.title || "this entry") + '"? This can\'t be undone.')) return;
-    var job = e.audioPath ? removeFile(e.audioPath).catch(function(){}) : Promise.resolve();
-    var pdfJob = e.notesPdfPath ? removeFile(e.notesPdfPath).catch(function(){}) : Promise.resolve();
-    var slideJobs = (e.slidePaths || []).map(function(p){ return removeFile(p).catch(function(){}); });
-    Promise.all([job, pdfJob].concat(slideJobs)).then(function(){ return db.doc("courses/" + state.currentCourseId + "/entries/" + id).delete(); }).then(backToList);
+    removeEntryCompletely(state.currentCourseId, e).then(backToList);
   }
 
   // Automatically turns a just-saved lecture's transcript into a first draft
@@ -1602,6 +1740,18 @@
     t.note = "";
     t.pct = Math.max(0, Math.min(99, Math.round(pct))); // 100% is only ever shown when finished
     t.label = label;
+    drawTrackers();
+  }
+  // The lecture is saved and the AI steps are running in the cloud, so closing
+  // the tab is already safe. The bar keeps moving while the tab stays open.
+  function setTrackerCloud(t, pct, doneCount, total, lastError){
+    if (!t) return;
+    t.status = "cloud";
+    t.pct = Math.max(t.pct || 0, Math.min(99, Math.round(pct)));
+    t.label = "Saved. It's safe to close this tab.";
+    t.note = /usage limit|busy/i.test(lastError || "")
+      ? "The AI is busy or at its limit, so your notes will take longer. They'll keep retrying automatically."
+      : "Your notes are finishing in the cloud (" + doneCount + " of " + total + " steps), and will appear here or the next time you open the app.";
     drawTrackers();
   }
   function finishTracker(t, problem){
@@ -1666,7 +1816,7 @@
   }
 
   function runAutoSummary(courseId, entryId, transcript, slideUrls){
-    return generateSummaryNotes(transcript, slideUrls).then(function(notes){
+    return generateSummaryNotes(transcript, slideUrls, courseTerms(courseId)).then(function(notes){
       delete state.autoSummaryPending[entryId];
       return finishAutoSummary(courseId, entryId, notes, null, transcript);
     }).catch(function(err){
@@ -2154,16 +2304,125 @@
     if (!AI_ENABLED){ finishTracker(t); return; }
     var transcript = (job.transcript || "").trim();
     if (transcript){
-      runLectureAi(job.courseId, job.entryId, transcript, job.segments, slideUrls, t, 65);
+      enqueueLectureAi(job.courseId, job.entryId, job.title, transcript, job.segments, slideUrls, t);
       return;
     }
     if (job.blob && job.blob.size){ runAutoTranscribe(job.courseId, job.entryId, job.blob, slideUrls, t); return; }
     finishTracker(t);
   }
-  function runLectureAi(courseId, entryId, transcript, segments, slideUrls, t, fromPct){
+  // Hands the AI steps to the Worker, so they carry on after this tab closes.
+  // If that isn't available, they run in this tab as before.
+  function enqueueLectureAi(courseId, entryId, title, transcript, segments, slideUrls, t){
     state.autoSummaryPending[entryId] = true;
     setNotesStatusIfOpen(entryId, "Generating an AI summary of this lecture…");
-    var total = 3, done = 0;
+    return fetch(window.aiConfig.workerUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode: "enqueue", courseId: courseId, entryId: entryId, transcript: transcript,
+        timestamped: lib.timestampedTranscript({ transcript: transcript, segments: segments }),
+        slideUrls: slideUrls || [], terms: courseTerms(courseId)
+      })
+    }).then(function(res){
+      return res.ok ? res.json() : {};
+    }).catch(function(){ return {}; }).then(function(data){
+      if (!data.queued) return runLectureAi(courseId, entryId, transcript, segments, slideUrls, t, 65, title);
+      db.doc("courses/" + courseId).update({ pendingJobs: firebase.firestore.FieldValue.arrayUnion(entryId) }).catch(function(){});
+      setTrackerCloud(t, 65, 0, JOB_STEP_COUNT);
+      watchJob(courseId, entryId, title, t);
+    });
+  }
+  var JOB_STEP_COUNT = 4, JOB_POLL_MS = 4000, JOB_STALE_MS = 120000;
+  // Watches a job in the Worker and applies the results once they're ready.
+  function watchJob(courseId, entryId, title, t){
+    state.watchedJobs = state.watchedJobs || {};
+    if (state.watchedJobs[entryId]) return;
+    var watch = state.watchedJobs[entryId] = { missing: 0, lastKick: 0 };
+    var key = "jobs/" + courseId + "/" + entryId + ".json";
+    function stop(){ delete state.watchedJobs[entryId]; }
+    function forget(){
+      db.doc("courses/" + courseId).update({ pendingJobs: firebase.firestore.FieldValue.arrayRemove(entryId) }).catch(function(){});
+    }
+    function check(){
+      fetchStoredAudio(cloudPath(key), true).then(function(buf){
+        watch.missing = 0;
+        var job = JSON.parse(new TextDecoder().decode(buf));
+        if (job.done){
+          stop();
+          return applyJobResults(courseId, entryId, job, t).then(function(){
+            return removeFile(cloudPath(key)).catch(function(){});
+          }).then(forget);
+        }
+        var doneCount = JOB_STEP_LIST.filter(function(s){ return job.steps[s]; }).length;
+        setTrackerCloud(t, 65 + 35 * doneCount / JOB_STEP_COUNT, doneCount, JOB_STEP_COUNT, job.lastError);
+        // If it's stalled, nudge it along rather than waiting on the schedule.
+        var now = Date.now();
+        if (!(job.leaseUntil > now) && now - watch.lastKick > JOB_STALE_MS / 2){
+          watch.lastKick = now;
+          fetch(window.aiConfig.workerUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mode: "jobkick", courseId: courseId, entryId: entryId })
+          }).catch(function(){});
+        }
+        setTimeout(check, JOB_POLL_MS);
+      }).catch(function(){
+        watch.missing++;
+        if (watch.missing >= 4 && navigator.onLine !== false){ stop(); forget(); removeTracker(t); return; }
+        setTimeout(check, JOB_POLL_MS);
+      });
+    }
+    check();
+  }
+  var JOB_STEP_LIST = ["summary", "title", "moments", "cleanup"];
+  function applyJobResults(courseId, entryId, job, t){
+    delete state.autoSummaryPending[entryId];
+    var ref = db.doc("courses/" + courseId + "/entries/" + entryId);
+    return ref.get().then(function(doc){
+      if (!doc.exists){ removeTracker(t); return; }
+      var data = doc.data();
+      var result = job.result || {};
+      var patch = {};
+      var onEntry = state.view === "detail" && state.currentEntryId === entryId;
+      var box = onEntry ? document.getElementById("notesArea") : null;
+      var typing = box && (document.activeElement === box || (box.value || "").trim());
+      var addNotes = result.notes && !(data.notesText || "").trim() && !typing;
+      if (addNotes){ patch.notesText = result.notes; patch.notesSummaryFailed = false; }
+      else if (!result.notes && !(data.notesText || "").trim()) patch.notesSummaryFailed = true;
+      if (result.cleanSections && result.cleanSections.length) patch.cleanTranscript = result.cleanSections.join("\n\n");
+      if (result.moments){
+        patch.keyMoments = result.moments.map(function(m){
+          return { t: m.time ? lib.parseStamp(m.time) : null, kind: m.kind || "announcement", text: m.text || "" };
+        });
+      }
+      return ref.update(patch).catch(function(){}).then(function(){
+        patchLocalEntry(entryId, patch);
+        if (state.view === "detail" && state.currentEntryId === entryId){
+          if (addNotes) setNotesEditorValue(result.notes, "preview");
+          var statusEl = document.getElementById("notesPanelStatus");
+          if (statusEl && !document.getElementById("notesPdfLink")) statusEl.textContent = patch.notesSummaryFailed ? "Couldn't generate an automatic summary — click \"Generate summary\" above to try again, or write your own." : "";
+          var slot = document.getElementById("cleanTranscriptSlot");
+          if (slot && patch.cleanTranscript){ slot.innerHTML = ""; slot.appendChild(renderCleanTranscriptPanel(patch.cleanTranscript)); }
+          refreshMomentsPanel(entryId);
+        }
+        return applyAiTitle(courseId, entryId, data.title, result.title);
+      }).then(function(){
+        if (!addNotes) return;
+        return autoSaveNotesPdf(entryId, courseId, Object.assign({ title: "Untitled lecture", date: nowIso() }, data, patch));
+      }).then(function(){
+        finishTracker(t, patch.notesSummaryFailed ? "Your notes couldn't be written automatically. Use \"Generate summary\" on the lecture page to try again." : "");
+      });
+    });
+  }
+  function scanPendingJobs(){
+    state.courses.forEach(function(c){
+      (c.pendingJobs || []).forEach(function(entryId){ watchJob(c.id, entryId, "", null); });
+    });
+  }
+  function runLectureAi(courseId, entryId, transcript, segments, slideUrls, t, fromPct, title){
+    state.autoSummaryPending[entryId] = true;
+    setNotesStatusIfOpen(entryId, "Generating an AI summary of this lecture…");
+    var total = 4, done = 0;
     function progress(){
       setTracker(t, fromPct + (100 - fromPct) * done / total, "Making your notes, clean transcript and key moments (" + done + " of " + total + " done)…");
     }
@@ -2174,7 +2433,8 @@
     return Promise.all([
       step(runAutoSummary(courseId, entryId, transcript, slideUrls)),
       step(runAutoCleanup(courseId, entryId, transcript)),
-      step(runAutoKeyMoments(courseId, entryId, { transcript: transcript, segments: segments }))
+      step(runAutoKeyMoments(courseId, entryId, { transcript: transcript, segments: segments })),
+      step(runAutoTitle(courseId, entryId, title, transcript))
     ]).then(function(results){
       // Cleanup and key moments are extras, so only missing notes are worth a mention.
       finishTracker(t, results[0] === false ? "Your notes couldn't be written automatically. Use \"Generate summary\" on the lecture page to try again." : "");
@@ -2199,7 +2459,7 @@
         state.autoTranscribePending[entryId] = "Transcribing the audio (section " + done + " of " + total + ")…";
         setTranscriptStatus(entryId, state.autoTranscribePending[entryId]);
         setTracker(t, 65 + 20 * (done - 1) / total, "Transcribing the audio (section " + done + " of " + total + ")…");
-      });
+      }, courseTerms(courseId));
     }).then(function(result){
       delete state.autoTranscribePending[entryId];
       var note = result.failed ? result.failed + " of " + result.total + " sections couldn't be transcribed — try \"Improve with AI\"." : "";
@@ -2212,7 +2472,7 @@
           if (area && !(area.value || "").trim()) area.value = result.transcript;
           refreshTimelinePanel(entryId);
         }
-        if (result.transcript.trim() && result.failed < result.total) return runLectureAi(courseId, entryId, result.transcript, result.segments, slideUrls, t, 85);
+        if (result.transcript.trim() && result.failed < result.total) return enqueueLectureAiFromTranscribe(courseId, entryId, result, slideUrls, t);
         finishTracker(t, "The audio is saved, but it couldn't be transcribed. Try \"Improve with AI\" on the lecture page.");
       });
     }).catch(function(err){
@@ -2220,6 +2480,12 @@
       setTranscriptStatus(entryId, "Couldn't transcribe this audio automatically (" + (err && err.message || err) + "). Try \"Improve with AI\".");
       updateEntryIn(courseId, entryId, { transcribeFailed: true });
       finishTracker(t, "The audio is saved, but it couldn't be transcribed. Try \"Improve with AI\" on the lecture page.");
+    });
+  }
+  function enqueueLectureAiFromTranscribe(courseId, entryId, result, slideUrls, t){
+    return db.doc("courses/" + courseId + "/entries/" + entryId).get().then(function(doc){
+      var title = doc.exists ? doc.data().title : "";
+      return runLectureAi(courseId, entryId, result.transcript, result.segments, slideUrls, t, 85, title);
     });
   }
   function attemptSaveRecording(){
@@ -2519,7 +2785,7 @@
       return fetch(window.aiConfig.workerUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "transcribe", audioBase64: b64, mimeType: (blob.type || rec.mimeType || "audio/webm").split(";")[0], contextTail: contextTail || "" })
+        body: JSON.stringify({ mode: "transcribe", audioBase64: b64, mimeType: (blob.type || rec.mimeType || "audio/webm").split(";")[0], contextTail: contextTail || "", terms: courseTerms(rec && rec.courseId) })
       });
     }).then(function(res){
       return res.json().then(function(data){
@@ -2813,7 +3079,8 @@
         el("button",{class:"study-tab", type:"button", onclick: openCourseAskAI},[text("Ask AI")]),
         el("button",{class:"study-tab", type:"button", onclick: openCourseFlashcards},[text("Flashcards")]),
         el("button",{class:"study-tab", type:"button", onclick: openCourseQuiz},[text("Quiz")]),
-        el("button",{class:"study-tab", type:"button", onclick: openExamPrep},[text("Exam prep")])
+        el("button",{class:"study-tab", type:"button", onclick: openExamPrep},[text("Exam prep")]),
+        el("button",{class:"study-tab", type:"button", onclick: openCourseTerms},[text("Course terms")])
       ]);
       header.appendChild(tabs);
     }
@@ -2847,7 +3114,13 @@
     if (state.view === "recording"){ renderRecordingPanel(content); return; }
     if (state.view === "detail"){ renderDetail(content); return; }
 
+    var sections = currentSections();
+    if (state.sectionFilter && !sections.some(function(s){ return s.id === state.sectionFilter; })) state.sectionFilter = null;
+    state.selectedIds = state.selectedIds.filter(function(id){ return state.entries.some(function(e){ return e.id === id; }); });
     var items = state.entries.slice();
+    if (state.sectionFilter){
+      items = items.filter(function(e){ return (e.sectionIds || []).indexOf(state.sectionFilter) > -1; });
+    }
     if (state.searchTerm.trim()){
       var q = state.searchTerm.trim().toLowerCase();
       items = items.filter(function(e){
@@ -2869,12 +3142,20 @@
     ]);
     sortSelect.value = state.sortBy;
     sortSelect.addEventListener("change", function(){ state.sortBy = sortSelect.value; renderContent(); });
+    toolbar.appendChild(state.entries.length ? el("button",{class:"btn btn-outline", id:"selectModeBtn", type:"button", onclick: function(){
+      state.selecting = !state.selecting;
+      state.selectedIds = [];
+      renderContent();
+    }},[text(state.selecting ? "Cancel" : "Select")]) : el("span",{}));
     toolbar.appendChild(sortSelect);
     content.appendChild(toolbar);
+    renderSectionBar(content, sections);
+    state.visibleIds = items.map(function(e){ return e.id; });
     if (items.length === 0){
+      var inSection = !!state.sectionFilter && !state.searchTerm.trim();
       content.appendChild(el("div",{class:"empty-state"},[
-        el("h2",{},[text(state.entries.length ? "No matches" : "Nothing here yet")]),
-        el("div",{},[text(state.entries.length ? "Try a different search." : "Record a lecture or add a note to get started with this course.")]),
+        el("h2",{},[text(inSection ? "Nothing in this section yet" : (state.entries.length ? "No matches" : "Nothing here yet"))]),
+        el("div",{},[text(inSection ? "Choose All, select some lectures, and add them here." : (state.entries.length ? "Try a different search." : "Record a lecture or add a note to get started with this course."))]),
         state.entries.length ? null : el("button",{class:"btn btn-primary", style:"margin-top:6px;", onclick: openCaptureChoice},[icon("mic"), text("Record a lecture")])
       ]));
       return;
@@ -2891,18 +3172,287 @@
         ev.stopPropagation();
         deleteEntry(e.id);
       }},[icon("trash")]);
-      var card = el("div",{class:"entry-card", onclick: function(){ openEntry(e.id); }},[
+      var isSelected = state.selectedIds.indexOf(e.id) > -1;
+      var check = null;
+      if (state.selecting){
+        check = el("input",{class:"entry-check", type:"checkbox", "aria-label":"Select " + (e.title || "Untitled"), onclick: function(ev){ ev.stopPropagation(); toggleSelected(e.id, card, check); }});
+        check.checked = isSelected;
+      }
+      var tags = sections.filter(function(s){ return (e.sectionIds || []).indexOf(s.id) > -1; }).map(function(s){ return s.name; });
+      var card = el("div",{class:"entry-card" + (isSelected ? " selected" : ""), onclick: function(){
+        if (state.selecting) toggleSelected(e.id, card, check);
+        else openEntry(e.id);
+      }},[
+        check,
         dateTile(e.date),
         el("div",{class:"entry-main"},[
           el("div",{class:"entry-title"},[text(e.title || "Untitled")]),
-          el("div",{class:"entry-sub mono"},[text(fmtDate(e.date) + (isLecture && e.durationSec ? " · " + fmtDuration(e.durationSec) : ""))]),
+          el("div",{class:"entry-sub mono"},[
+            text(fmtDate(e.date) + (isLecture && e.durationSec ? " · " + fmtDuration(e.durationSec) : "")),
+            tags.length ? el("span",{class:"entry-tag"},[text(" · " + tags.join(", "))]) : null
+          ]),
           el("div",{class:"entry-snippet"},[text(previewText(e))])
         ]),
-        el("div",{class:"entry-actions"},[renameBtn, deleteBtn])
+        state.selecting ? null : el("div",{class:"entry-actions"},[renameBtn, deleteBtn])
       ]);
       list.appendChild(card);
     });
     content.appendChild(list);
+    if (state.selecting){
+      content.appendChild(el("div",{class:"selection-bar", id:"selectionBar"}));
+      drawSelectionBar();
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Sections, selecting several lectures, and combined notes
+  // ---------------------------------------------------------------
+  function currentCourse(){ return state.courses.find(function(c){ return c.id === state.currentCourseId; }); }
+  function currentSections(){
+    var course = currentCourse();
+    return (course && Array.isArray(course.sections)) ? course.sections : [];
+  }
+  function selectedEntries(){
+    return state.entries.filter(function(e){ return state.selectedIds.indexOf(e.id) > -1; });
+  }
+  function toggleSelected(id, card, check){
+    var at = state.selectedIds.indexOf(id);
+    if (at > -1) state.selectedIds.splice(at, 1); else state.selectedIds.push(id);
+    var on = at === -1;
+    card.classList.toggle("selected", on);
+    if (check) check.checked = on;
+    drawSelectionBar();
+  }
+  function drawSelectionBar(){
+    var bar = document.getElementById("selectionBar");
+    if (!bar) return;
+    bar.innerHTML = "";
+    var count = state.selectedIds.length;
+    var visible = state.visibleIds || [];
+    var allOn = visible.length > 0 && visible.every(function(id){ return state.selectedIds.indexOf(id) > -1; });
+    var none = count === 0 || state.bulkBusy;
+    bar.appendChild(el("div",{class:"selection-count"},[text(state.bulkBusy ? "Working…" : count + " selected")]));
+    bar.appendChild(el("button",{class:"btn btn-ghost", type:"button", disabled: state.bulkBusy, onclick: function(){
+      state.selectedIds = allOn ? [] : visible.slice();
+      renderContent();
+    }},[text(allOn ? "Clear all" : "Select all")]));
+    bar.appendChild(el("button",{class:"btn btn-outline", type:"button", disabled: none, onclick: function(){
+      openCombinedNotes(selectedEntries(), "Combined notes", state.sectionFilter);
+    }},[text("Get notes")]));
+    bar.appendChild(el("button",{class:"btn btn-outline", type:"button", disabled: none, onclick: openSectionPicker},[text("Add to section")]));
+    if (state.sectionFilter){
+      bar.appendChild(el("button",{class:"btn btn-outline", type:"button", disabled: none, onclick: function(){
+        applyToSelected({ sectionIds: firebase.firestore.FieldValue.arrayRemove(state.sectionFilter) });
+      }},[text("Remove from section")]));
+    }
+    bar.appendChild(el("button",{class:"btn btn-danger", type:"button", style:"padding:7px 14px; font-size:13px;", disabled: none, onclick: deleteSelected},[text("Delete")]));
+  }
+  function finishSelecting(){
+    state.bulkBusy = false;
+    state.selecting = false;
+    state.selectedIds = [];
+    renderContent();
+  }
+  function applyToSelected(patch){
+    var courseId = state.currentCourseId;
+    var ids = state.selectedIds.slice();
+    state.bulkBusy = true;
+    drawSelectionBar();
+    var failed = 0;
+    inPool(ids, 6, function(id){
+      return db.doc("courses/" + courseId + "/entries/" + id).update(patch).catch(function(){ failed++; });
+    }).then(function(){
+      finishSelecting();
+      if (failed) alert(failed + " of " + ids.length + " couldn't be updated. Try those again.");
+    });
+  }
+  function deleteSelected(){
+    var entries = selectedEntries();
+    var count = entries.length;
+    if (!count) return;
+    var label = count === 1 ? '"' + (entries[0].title || "this entry") + '"' : count + " lectures and notes";
+    if (!confirm("Delete " + label + ", including recordings, slides and notes? This can't be undone.")) return;
+    var courseId = state.currentCourseId;
+    state.bulkBusy = true;
+    drawSelectionBar();
+    var failed = 0;
+    inPool(entries, 3, function(e){
+      return removeEntryCompletely(courseId, e).catch(function(){ failed++; });
+    }).then(function(){
+      finishSelecting();
+      if (failed) alert(failed + " of " + count + " couldn't be deleted. Try those again.");
+    });
+  }
+  function renderSectionBar(content, sections){
+    if (!state.entries.length) return;
+    var bar = el("div",{class:"section-bar"});
+    function chip(label, id){
+      return el("button",{class:"section-chip" + (state.sectionFilter === id ? " on" : ""), type:"button", onclick: function(){
+        state.sectionFilter = id;
+        renderContent();
+      }},[text(label)]);
+    }
+    if (!sections.length) return;
+    bar.appendChild(chip("All", null));
+    sections.forEach(function(s){
+      var n = state.entries.filter(function(e){ return (e.sectionIds || []).indexOf(s.id) > -1; }).length;
+      bar.appendChild(chip(s.name + " (" + n + ")", s.id));
+    });
+    content.appendChild(bar);
+    var active = sections.find(function(s){ return s.id === state.sectionFilter; });
+    if (!active || state.selecting) return;
+    var members = state.entries.filter(function(e){ return (e.sectionIds || []).indexOf(active.id) > -1; });
+    content.appendChild(el("div",{class:"section-tools"},[
+      el("button",{class:"btn btn-primary", type:"button", disabled: !members.length, onclick: function(){
+        openCombinedNotes(members, "Notes — " + active.name, active.id);
+      }},[text("Get notes from this section")]),
+      el("button",{class:"btn btn-ghost", type:"button", onclick: function(){
+        var name = prompt("Rename this section:", active.name);
+        if (name === null || !name.trim()) return;
+        updateCourseData({ sections: sections.map(function(s){ return s.id === active.id ? { id: s.id, name: name.trim() } : s; }) }).catch(function(err){ alert("Couldn't rename it: " + err.message); });
+      }},[text("Rename")]),
+      el("button",{class:"btn btn-ghost", type:"button", onclick: function(){
+        if (!confirm('Delete the section "' + active.name + '"? Its lectures and notes are kept.')) return;
+        var courseId = state.currentCourseId;
+        state.sectionFilter = null;
+        inPool(members, 6, function(e){
+          return db.doc("courses/" + courseId + "/entries/" + e.id).update({ sectionIds: firebase.firestore.FieldValue.arrayRemove(active.id) }).catch(function(){});
+        }).then(function(){
+          return updateCourseData({ sections: sections.filter(function(s){ return s.id !== active.id; }) });
+        }).catch(function(err){ alert("Couldn't delete it: " + err.message); });
+        renderContent();
+      }},[text("Delete section")])
+    ]));
+  }
+  function openSectionPicker(){
+    var root = document.getElementById("modalRoot");
+    var sections = currentSections();
+    var nameInput = el("input",{placeholder:"e.g. Midterm 1"});
+    function addTo(id){
+      closeModal();
+      applyToSelected({ sectionIds: firebase.firestore.FieldValue.arrayUnion(id) });
+    }
+    function createAndAdd(){
+      var name = nameInput.value.trim();
+      if (!name){ nameInput.focus(); return; }
+      var existing = sections.find(function(s){ return s.name.toLowerCase() === name.toLowerCase(); });
+      if (existing){ addTo(existing.id); return; }
+      var section = { id: "s" + Date.now().toString(36), name: name };
+      updateCourseData({ sections: firebase.firestore.FieldValue.arrayUnion(section) }).then(function(){ addTo(section.id); }).catch(function(err){
+        alert("Couldn't create the section: " + err.message);
+      });
+    }
+    nameInput.addEventListener("keydown", function(ev){ if (ev.key === "Enter") createAndAdd(); });
+    var count = state.selectedIds.length;
+    var pick = el("div",{class:"section-pick"});
+    sections.forEach(function(s){
+      pick.appendChild(el("button",{class:"btn btn-outline", type:"button", onclick: function(){ addTo(s.id); }},[text(s.name)]));
+    });
+    var modal = el("div",{class:"modal"},[
+      el("h3",{},[text("Add " + count + (count === 1 ? " item" : " items") + " to a section")]),
+      sections.length ? pick : null,
+      el("div",{class:"field"},[el("label",{},[text("New section")]), nameInput]),
+      el("div",{class:"modal-actions"},[
+        el("button",{class:"btn btn-outline", type:"button", onclick: closeModal},[text("Cancel")]),
+        el("button",{class:"btn btn-primary", type:"button", onclick: createAndAdd},[text("Create and add")])
+      ])
+    ]);
+    root.innerHTML = "";
+    root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
+    setTimeout(function(){ nameInput.focus(); }, 0);
+  }
+
+  var COMBINE_LIMIT = 100000; // how much the Worker reads for a summary
+  function mergedNotesText(entries){
+    return entries.map(function(e){
+      var body = (e.notesText || "").trim();
+      // Each lecture becomes a heading, so its own headings move down a level.
+      body = body ? body.replace(/^(#{1,2})\s/gm, "### ") : "No notes for this one yet.";
+      return "## " + (e.title || "Untitled") + "\n\n" + body;
+    }).join("\n\n");
+  }
+  // Uses full transcripts when they fit. When they don't, a lecture's shorter
+  // notes stand in for its transcript, so every lecture is still covered.
+  function combinedMaterial(entries){
+    function build(preferNotes){
+      return entries.map(function(e){
+        var text = preferNotes ? (e.notesText || e.transcript || "") : [e.transcript, e.notesText].filter(Boolean).join("\n\n");
+        return "=== " + (e.title || "Untitled") + " ===\n" + text;
+      }).join("\n\n");
+    }
+    var full = build(false);
+    return full.length <= COMBINE_LIMIT ? { text: full, partial: false } : { text: build(true), partial: true };
+  }
+  function openCombinedNotes(entries, title, sectionId){
+    var root = document.getElementById("modalRoot");
+    var course = currentCourse();
+    var ordered = entries.slice().sort(function(a, b){ return String(a.date || "").localeCompare(String(b.date || "")); });
+    var modal = el("div",{class:"modal", style:"max-width:640px;"});
+    var count = ordered.length + (ordered.length === 1 ? " item" : " items");
+    function showResult(notes, note){
+      modal.innerHTML = "";
+      modal.appendChild(el("h3",{},[text(title)]));
+      if (note) modal.appendChild(el("div",{class:"rec-note", style:"margin-bottom:10px;"},[text(note)]));
+      var body = el("div",{class:"notes-preview guide-body"});
+      lib.renderNotes(body, notes);
+      modal.appendChild(body);
+      modal.appendChild(el("div",{class:"modal-actions", style:"justify-content:space-between; flex-wrap:wrap;"},[
+        el("button",{class:"btn btn-outline", type:"button", onclick: showChoice},[text("Back")]),
+        el("div",{style:"display:flex; gap:8px; flex-wrap:wrap;"},[
+          el("button",{class:"btn btn-outline", type:"button", onclick: function(){
+            downloadEntryPdf({ title: title, date: nowIso(), notesText: notes }, course ? course.name : "");
+          }},[text("Export as PDF")]),
+          el("button",{class:"btn btn-primary", type:"button", onclick: function(){
+            closeModal();
+            state.selecting = false;
+            state.selectedIds = [];
+            addNoteEntry(title, notes, sectionId);
+          }},[text("Save to course")])
+        ])
+      ]));
+    }
+    function runAi(){
+      var material = combinedMaterial(ordered);
+      modal.innerHTML = "";
+      modal.appendChild(el("h3",{},[text(title)]));
+      modal.appendChild(el("div",{class:"rec-note"},[text("Writing notes across " + count + "…")]));
+      generateSummaryNotes(material.text, slideUrlsFor(ordered), courseTerms(state.currentCourseId)).then(function(notes){
+        if (!notes.trim()) throw new Error("The AI didn't return notes.");
+        var cutOff = material.text.length > COMBINE_LIMIT;
+        showResult(notes, cutOff
+          ? "That's a lot of material, so these notes may leave out the last lectures. Select fewer for better coverage."
+          : (material.partial ? "To fit everything, your existing notes were used in place of full transcripts where available." : ""));
+      }).catch(function(err){
+        modal.innerHTML = "";
+        modal.appendChild(el("h3",{},[text(title)]));
+        modal.appendChild(el("div",{class:"rec-warn"},[text("Couldn't write the notes (" + (err && err.message || err) + ").")]));
+        modal.appendChild(el("div",{class:"modal-actions"},[el("button",{class:"btn btn-outline", type:"button", onclick: showChoice},[text("Back")])]));
+      });
+    }
+    function showChoice(){
+      modal.innerHTML = "";
+      modal.appendChild(el("h3",{},[text(title)]));
+      modal.appendChild(el("div",{class:"rec-note", style:"margin-bottom:12px;"},[text("From " + count + ", oldest first.")]));
+      var withText = ordered.filter(function(e){ return (e.transcript || "").trim() || (e.notesText || "").trim(); }).length;
+      var withNotes = ordered.filter(function(e){ return (e.notesText || "").trim(); }).length;
+      var choices = el("div",{class:"notes-choice"},[
+        el("button",{class:"rec-choice-btn", type:"button", disabled: !withNotes, onclick: function(){ showResult(mergedNotesText(ordered), ""); }},[
+          el("div",{class:"rec-choice-title"},[text("Put my notes together")]),
+          el("div",{class:"rec-choice-desc"},[text("All the existing notes in one document, unchanged. " + withNotes + " of " + ordered.length + " have notes.")])
+        ])
+      ]);
+      if (AI_ENABLED){
+        choices.appendChild(el("button",{class:"rec-choice-btn", type:"button", disabled: !withText, onclick: runAi},[
+          el("div",{class:"rec-choice-title"},[text("Write new notes with AI")]),
+          el("div",{class:"rec-choice-desc"},[text("One organized set of notes covering all of it.")])
+        ]));
+      }
+      modal.appendChild(choices);
+      modal.appendChild(el("div",{class:"modal-actions"},[el("button",{class:"btn btn-outline", type:"button", onclick: closeModal},[text("Close")])]));
+    }
+    showChoice();
+    root.innerHTML = "";
+    root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
   }
 
   function renderHomeDashboard(content){
@@ -3257,7 +3807,7 @@
       var tSaveDot = el("span",{class:"save-dot", id:"tDot"});
       var tArea = el("textarea",{id:"transcriptArea", placeholder:"Paste a transcript here, type your own, or upload a .txt file below."});
       tArea.value = e.transcript || "";
-      var saveT = debounce(function(){ updateEntry(e.id, {transcript: tArea.value}); flashDot("tDot"); }, 700);
+      var saveT = debounce(function(){ updateEntry(e.id, {transcript: tArea.value, aiStale: true}); patchLocalEntry(e.id, {transcript: tArea.value, aiStale: true}); refreshStaleNotice(e.id); flashDot("tDot"); }, 700);
       tArea.addEventListener("input", saveT);
       var tFileInput = el("input",{type:"file", accept:".txt,text/plain", style:"display:none;"});
       tFileInput.addEventListener("change", function(){
@@ -3271,7 +3821,9 @@
             replace = confirm("Replace the existing transcript with this file's contents? Click Cancel to append instead.");
           }
           tArea.value = replace ? incoming : (tArea.value + "\n\n" + incoming);
-          updateEntry(e.id, {transcript: tArea.value});
+          updateEntry(e.id, {transcript: tArea.value, aiStale: true});
+          patchLocalEntry(e.id, {transcript: tArea.value, aiStale: true});
+          refreshStaleNotice(e.id);
           flashDot("tDot");
         };
         reader.onerror = function(){ alert("Couldn't read that file."); };
@@ -3285,10 +3837,10 @@
         var applyNewTranscript = function(newText, segments){
           var FieldValue = firebase.firestore.FieldValue;
           var previous = tArea.value;
-          var patch = { transcript: newText, previousTranscript: previous, cleanTranscript: FieldValue.delete() };
+          var patch = { transcript: newText, previousTranscript: previous, cleanTranscript: FieldValue.delete(), aiStale: false };
           if (segments) patch.segments = segments;
           updateEntryIn(improveCourseId, e.id, patch);
-          var local = { transcript: newText, previousTranscript: previous, cleanTranscript: null };
+          var local = { transcript: newText, previousTranscript: previous, cleanTranscript: null, aiStale: false };
           if (segments) local.segments = segments;
           patchLocalEntry(e.id, local);
           tArea.value = newText;
@@ -3309,7 +3861,7 @@
           fetchStoredAudio(e.audioPath).then(function(buf){
             return transcribeAudioInSections(buf, function(done, total){
               aiTranscribeBtn.textContent = "Transcribing " + done + "/" + total + "…";
-            });
+            }, courseTerms(improveCourseId));
           }).then(function(result){
             if (!result.transcript.trim() || result.failed === result.total){ alert("The AI couldn't transcribe this audio. Your transcript wasn't changed."); return; }
             if (result.failed && !confirm(result.failed + " of " + result.total + " sections couldn't be transcribed and will be marked in the text. Use this transcript anyway?")) return;
@@ -3350,6 +3902,7 @@
         tArea,
         el("div",{class:"rec-note", id:"transcriptStatus", style:"margin-top:6px;"},[text(state.autoTranscribePending[e.id] || (e.transcribeFailed && !(e.transcript || "").trim() ? "Couldn't transcribe this audio automatically. Try \"Improve with AI\"." : ""))])
       ]));
+      content.appendChild(el("div",{id:"aiStaleSlot"}));
       var cleanSlot = el("div",{id:"cleanTranscriptSlot"});
       if (e.cleanTranscript) cleanSlot.appendChild(renderCleanTranscriptPanel(e.cleanTranscript));
       content.appendChild(cleanSlot);
@@ -3407,7 +3960,15 @@
       if (tArea) edits.transcript = tArea.value;
       downloadEntryPdf(Object.assign({}, latest, edits), courseForExport ? courseForExport.name : "");
     }},[text("Export as PDF")]);
-    var notesActions = el("div",{style:"display:flex; gap:6px;"},[exportBtn]);
+    var notesActions = el("div",{style:"display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;"},[exportBtn]);
+    if (AI_ENABLED){
+      notesActions.appendChild(el("button",{class:"btn btn-outline", type:"button", style:"padding:4px 10px; font-size:12.5px;", onclick: function(){
+        var latest = state.entries.find(function(x){ return x.id === e.id; }) || e;
+        var material = [tArea ? tArea.value : latest.transcript, nArea.value].filter(Boolean).join("\n\n");
+        if (!material.trim()){ alert("Add a transcript or some notes first."); return; }
+        openCourseFlashcards({ contextText: material, slideUrls: slideUrlsFor([latest]), autoGenerate: true });
+      }},[text("Make flashcards")]));
+    }
     if (isLecture && AI_ENABLED){
       var summaryBtn = el("button",{class:"btn btn-outline", type:"button", style:"padding:4px 10px; font-size:12.5px;", onclick: function(){
         var sourceTranscript = tArea ? tArea.value : (e.transcript || "");
@@ -3415,7 +3976,7 @@
         if ((nArea.value || "").trim() && !confirm("Generate an AI summary from the transcript? This will replace the notes below (and save automatically).")) return;
         summaryBtn.setAttribute("disabled","disabled"); summaryBtn.textContent = "Generating…";
         var latest = state.entries.find(function(x){ return x.id === e.id; }) || e;
-        generateSummaryNotes(sourceTranscript, slideUrlsFor([latest])).then(function(notes){
+        generateSummaryNotes(sourceTranscript, slideUrlsFor([latest]), courseTerms(state.currentCourseId)).then(function(notes){
           setNotesEditorValue(notes, "preview");
           updateEntry(e.id, { notesText: notes, notesSummaryFailed: false });
           flashDot("nDot");
@@ -3445,11 +4006,37 @@
     if (AI_ENABLED) renderAskAIPanel(content, e);
     refreshMomentsPanel(e.id);
     refreshTimelinePanel(e.id);
+    refreshStaleNotice(e.id);
+  }
+  // After a transcript is edited by hand, what the AI made from it is out of
+  // date. Offering an update beats silently replacing anything.
+  function refreshStaleNotice(entryId){
+    var slot = document.getElementById("aiStaleSlot");
+    var e = state.entries.find(function(x){ return x.id === entryId; });
+    if (!slot || !e) return;
+    slot.innerHTML = "";
+    if (!AI_ENABLED || !e.aiStale || !(e.cleanTranscript || (e.keyMoments && e.keyMoments.length))) return;
+    var courseId = state.currentCourseId;
+    var btn = el("button",{class:"btn btn-outline", type:"button", style:"padding:4px 10px; font-size:12.5px;", onclick: function(){
+      btn.setAttribute("disabled","disabled"); btn.textContent = "Updating…";
+      Promise.all([
+        runAutoCleanup(courseId, entryId, e.transcript),
+        runAutoKeyMoments(courseId, entryId, { transcript: e.transcript, segments: [] })
+      ]).then(function(){
+        updateEntryIn(courseId, entryId, { aiStale: false });
+        patchLocalEntry(entryId, { aiStale: false });
+        refreshStaleNotice(entryId);
+      });
+    }},[text("Update")]);
+    slot.appendChild(el("div",{class:"stale-notice"},[
+      el("span",{},[text("You edited this transcript, so the clean version and key moments may be out of date.")]),
+      btn
+    ]));
   }
   // Puts the lecture's sections into tabs, so the page shows one thing at a time.
   function arrangeDetailTabs(content, e){
     var byId = function(id){ return document.getElementById(id); };
-    var transcriptNodes = [byId("timelineSlot"), byId("cleanTranscriptSlot")];
+    var transcriptNodes = [byId("aiStaleSlot"), byId("timelineSlot"), byId("cleanTranscriptSlot")];
     var rawPanel = byId("transcriptPanel");
     if (rawPanel && e.cleanTranscript){
       var details = el("details",{class:"raw-details"},[ el("summary",{},[text("Original transcript")]) ]);
@@ -3708,6 +4295,28 @@
     root.innerHTML = "";
     root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
     setTimeout(function(){ titleInput.focus(); }, 0);
+  }
+
+  function openCourseTerms(){
+    var root = document.getElementById("modalRoot");
+    var course = state.courses.find(function(c){ return c.id === state.currentCourseId; });
+    var box = el("textarea",{rows:"5", maxlength:"1000", placeholder:"e.g. Krebs cycle, Dr. Nguyen, NADH, oxidative phosphorylation"});
+    box.value = (course && course.terms) || "";
+    var modal = el("div",{class:"modal"},[
+      el("h3",{},[text("Course terms — " + (course ? course.name : "this course"))]),
+      el("div",{class:"rec-note", style:"margin-bottom:12px;"},[text("List names and terms the AI might otherwise spell wrong. Future transcripts and notes in this course will use these spellings.")]),
+      el("div",{class:"field"},[box]),
+      el("div",{class:"modal-actions"},[
+        el("button",{class:"btn btn-outline", onclick: closeModal},[text("Cancel")]),
+        el("button",{class:"btn btn-primary", onclick: function(){
+          updateCourseData({ terms: box.value.trim() }).catch(function(err){ alert("Couldn't save the terms: " + err.message); });
+          closeModal();
+        }},[text("Save terms")])
+      ])
+    ]);
+    root.innerHTML = "";
+    root.appendChild(el("div",{class:"modal-backdrop", onclick: function(e2){ if (e2.target === e2.currentTarget) closeModal(); }},[modal]));
+    setTimeout(function(){ box.focus(); }, 0);
   }
 
   function openCourseAskAI(){
